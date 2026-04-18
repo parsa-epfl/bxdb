@@ -1,0 +1,23 @@
+[package]
+name = "bxdb"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "bxdb"
+crate-type = ["rlib", "cdylib", "staticlib"]
+
+[[bin]]
+name = "bxdb-convert"
+path = "src/bin/bxdb_convert.rs"
+
+[dependencies]
+zstd = "0.13"
+rustc-hash = "2"
+crossbeam-channel = "0.5"
+parking_lot = "0.12"
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+rand = "0.8"
