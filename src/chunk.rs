@@ -11,6 +11,7 @@ pub const MAGIC_LOG: [u8; 8] = *b"BXDBLOG\0";
 pub const MAGIC_IDX: [u8; 8] = *b"BXDBIDX\0";
 pub const FORMAT_VERSION: u8 = 0x01;
 pub const HEADER_SIZE: usize = 16;
+pub const LOG_RECORD_BASE_SIZE: usize = 22;
 
 pub const CHUNK_FULL: u8 = 0;
 pub const CHUNK_DELTA: u8 = 1;
@@ -90,7 +91,11 @@ impl ChunkRecord {
     }
 
     pub fn encoded_len(&self) -> usize {
-        if self.kind == ChunkKind::Delta { 30 } else { 22 }
+        if self.kind == ChunkKind::Delta {
+            LOG_RECORD_BASE_SIZE + 8
+        } else {
+            LOG_RECORD_BASE_SIZE
+        }
     }
 
     pub fn write_to<W: Write>(&self, w: &mut W) -> io::Result<()> {
@@ -109,7 +114,7 @@ impl ChunkRecord {
     }
 
     pub fn read_from<R: Read>(r: &mut R) -> io::Result<Option<Self>> {
-        let mut head = [0u8; 22];
+        let mut head = [0u8; LOG_RECORD_BASE_SIZE];
         match r.read_exact(&mut head) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
@@ -193,7 +198,7 @@ pub fn apply_delta_patch(base: &[u8; PAGE_SIZE], blob: &[u8], out: &mut [u8; PAG
 }
 
 pub fn compute_xor_patch(page: &[u8; PAGE_SIZE], base: &[u8; PAGE_SIZE]) -> Vec<(u16, u64)> {
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(32);
     for i in 0..PAGE_WORDS {
         let pw = u64::from_le_bytes(page[i * 8..(i + 1) * 8].try_into().unwrap());
         let bw = u64::from_le_bytes(base[i * 8..(i + 1) * 8].try_into().unwrap());

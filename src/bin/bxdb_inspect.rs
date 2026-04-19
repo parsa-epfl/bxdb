@@ -6,7 +6,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use bxdb::chunk::{
-    ChunkKind, ChunkRecord, FIXED_RECORD_SIZE, MAGIC_IDX, MAGIC_LOG, pa_of, snapshot_of,
+    ChunkKind, ChunkRecord, FIXED_RECORD_SIZE, HEADER_SIZE, LOG_RECORD_BASE_SIZE, MAGIC_IDX,
+    MAGIC_LOG, pa_of, snapshot_of,
 };
 use bxdb::format::read_and_verify_header;
 use bxdb::read::IndexMode;
@@ -55,9 +56,12 @@ fn load_records(dir: &Path) -> io::Result<(IndexMode, Vec<ChunkRecord>)> {
     let log_path = dir.join("chunks.log");
     if idx_path.exists() {
         let f = File::open(&idx_path)?;
+        let meta = f.metadata()?;
         let mut r = BufReader::new(f);
         read_and_verify_header(&mut r, &MAGIC_IDX)?;
-        let mut records = Vec::new();
+        let capacity = (meta.len().saturating_sub(HEADER_SIZE as u64)
+            / FIXED_RECORD_SIZE as u64) as usize;
+        let mut records = Vec::with_capacity(capacity);
         let mut buf = [0u8; FIXED_RECORD_SIZE];
         loop {
             match r.read_exact(&mut buf) {
@@ -69,9 +73,12 @@ fn load_records(dir: &Path) -> io::Result<(IndexMode, Vec<ChunkRecord>)> {
         Ok((IndexMode::BTree, records))
     } else if log_path.exists() {
         let f = File::open(&log_path)?;
+        let meta = f.metadata()?;
         let mut r = BufReader::new(f);
         read_and_verify_header(&mut r, &MAGIC_LOG)?;
-        let mut records = Vec::new();
+        let capacity = (meta.len().saturating_sub(HEADER_SIZE as u64)
+            / LOG_RECORD_BASE_SIZE as u64) as usize;
+        let mut records = Vec::with_capacity(capacity);
         while let Some(rec) = ChunkRecord::read_from(&mut r)? {
             records.push(rec);
         }
@@ -94,7 +101,12 @@ struct Stats {
 
 impl Stats {
     fn from_records(records: &[ChunkRecord]) -> Self {
-        let mut s = Self { total: records.len(), full: 0, delta: 0, zero: 0 };
+        let mut s = Self {
+            total: records.len(),
+            full: 0,
+            delta: 0,
+            zero: 0,
+        };
         for r in records {
             match r.kind {
                 ChunkKind::Full => s.full += 1,
@@ -333,8 +345,8 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
             Span::raw(format!("{:>6} ({:5.1}%)", s.zero, s.pct(s.zero))),
         ]),
     ];
-    let p = Paragraph::new(lines)
-        .block(Block::default().borders(Borders::ALL).title("bxdb-inspect"));
+    let p =
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("bxdb-inspect"));
     f.render_widget(p, area);
 }
 
@@ -389,7 +401,10 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &App) {
                 ]),
                 Line::from(vec![
                     Span::raw("PA (45 bits):  "),
-                    Span::styled(format!("0x{pa:x}  ({pa})"), Style::default().fg(Color::Cyan)),
+                    Span::styled(
+                        format!("0x{pa:x}  ({pa})"),
+                        Style::default().fg(Color::Cyan),
+                    ),
                 ]),
                 Line::from(vec![
                     Span::raw("Snapshot id:   "),
@@ -525,9 +540,7 @@ fn append_hex(out: &mut Vec<Line<'_>>, data: &[u8]) {
                 '.'
             });
         }
-        out.push(Line::raw(format!(
-            "  {off:04x}  {hex:<50}  |{asc}|"
-        )));
+        out.push(Line::raw(format!("  {off:04x}  {hex:<50}  |{asc}|")));
     }
 }
 

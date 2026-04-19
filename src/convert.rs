@@ -3,7 +3,7 @@ use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
 use crate::chunk::{
-    ChunkRecord, FIXED_RECORD_SIZE, MAGIC_IDX, MAGIC_LOG,
+    ChunkRecord, FIXED_RECORD_SIZE, HEADER_SIZE, LOG_RECORD_BASE_SIZE, MAGIC_IDX, MAGIC_LOG,
 };
 use crate::format::{read_and_verify_header, write_index_header, write_log_header};
 
@@ -12,10 +12,13 @@ pub fn to_btree(dir: &Path) -> io::Result<()> {
     let idx_path = dir.join("index.bxdb");
 
     let log = File::open(&log_path)?;
+    let meta = log.metadata()?;
     let mut r = BufReader::new(log);
     read_and_verify_header(&mut r, &MAGIC_LOG)?;
 
-    let mut records: Vec<ChunkRecord> = Vec::new();
+    let capacity = (meta.len().saturating_sub(HEADER_SIZE as u64)
+        / LOG_RECORD_BASE_SIZE as u64) as usize;
+    let mut records: Vec<ChunkRecord> = Vec::with_capacity(capacity);
     while let Some(rec) = ChunkRecord::read_from(&mut r)? {
         records.push(rec);
     }
@@ -48,10 +51,13 @@ pub fn to_log(dir: &Path) -> io::Result<()> {
     let log_path = dir.join("chunks.log");
 
     let idx = File::open(&idx_path)?;
+    let meta = idx.metadata()?;
     let mut r = BufReader::new(idx);
     read_and_verify_header(&mut r, &MAGIC_IDX)?;
 
-    let mut records: Vec<ChunkRecord> = Vec::new();
+    let capacity = (meta.len().saturating_sub(HEADER_SIZE as u64)
+        / FIXED_RECORD_SIZE as u64) as usize;
+    let mut records: Vec<ChunkRecord> = Vec::with_capacity(capacity);
     let mut buf = [0u8; FIXED_RECORD_SIZE];
     loop {
         match r.read_exact(&mut buf) {

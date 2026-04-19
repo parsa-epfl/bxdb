@@ -53,7 +53,7 @@ fn write_read_single_snapshot_btree() {
 
     let mut memory = make_memory(n_pages as usize);
     let mut bitmap = vec![0u64; 1];
-    let mut pages = Vec::new();
+    let mut pages = Vec::with_capacity(n_pages as usize);
     for i in 0..n_pages {
         let p = random_page(&mut rng);
         set_page(&mut memory, i as usize, &p);

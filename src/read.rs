@@ -12,8 +12,8 @@ use rustc_hash::FxHashMap;
 
 use crate::cache::SharedCache;
 use crate::chunk::{
-    ChunkKind, ChunkRecord, FIXED_RECORD_SIZE, HEADER_SIZE, MAGIC_IDX, MAGIC_LOG,
-    MAX_SNAPSHOT_ID, PAGE_SIZE, apply_delta_patch, encode_key, pa_of, snapshot_of,
+    ChunkKind, ChunkRecord, FIXED_RECORD_SIZE, HEADER_SIZE, LOG_RECORD_BASE_SIZE, MAGIC_IDX,
+    MAGIC_LOG, MAX_SNAPSHOT_ID, PAGE_SIZE, apply_delta_patch, encode_key, pa_of, snapshot_of,
 };
 use crate::format::{peek_magic, read_and_verify_header};
 
@@ -475,9 +475,12 @@ fn verify_log_header(path: &Path) -> io::Result<()> {
 
 fn build_lazy_index(path: &Path) -> io::Result<LazyIndex> {
     let file = File::open(path)?;
+    let meta = file.metadata()?;
     let mut r = BufReader::new(file);
     read_and_verify_header(&mut r, &MAGIC_LOG)?;
-    let mut records: Vec<ChunkRecord> = Vec::new();
+    let capacity = (meta.len().saturating_sub(HEADER_SIZE as u64)
+        / LOG_RECORD_BASE_SIZE as u64) as usize;
+    let mut records: Vec<ChunkRecord> = Vec::with_capacity(capacity);
     while let Some(rec) = ChunkRecord::read_from(&mut r)? {
         records.push(rec);
     }
