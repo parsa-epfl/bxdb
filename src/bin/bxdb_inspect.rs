@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::fs::File;
 use std::io::{self, BufReader, Read};
 use std::os::unix::fs::FileExt;
@@ -121,7 +121,7 @@ struct App {
     records: Vec<ChunkRecord>,
     stats: Stats,
     list_state: ListState,
-    blob_files: HashMap<u8, File>,
+    blob_files: FxHashMap<u8, File>,
     detail_scroll: u16,
     detail: Option<(usize, Detail)>,
 }
@@ -145,7 +145,7 @@ impl App {
             records,
             stats,
             list_state,
-            blob_files: HashMap::new(),
+            blob_files: FxHashMap::default(),
             detail_scroll: 0,
             detail: None,
         }

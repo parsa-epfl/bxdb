@@ -2,20 +2,26 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::thread;
 
 use parking_lot::{Mutex, RwLock};
+use rayon::ThreadPool;
 use rustc_hash::FxHashMap;
 
 use crate::chunk::{
-    ChunkRecord, DEFAULT_DELTA_THRESHOLD, MAX_SNAPSHOT_ID, MAGIC_LOG, PAGE_SIZE,
-    compute_xor_patch, encode_delta_patch, encode_key, is_all_zero,
+    ChunkRecord, DEFAULT_DELTA_THRESHOLD, MAGIC_LOG, MAX_SNAPSHOT_ID, PAGE_SIZE, compute_xor_patch,
+    encode_delta_patch, encode_key, is_all_zero,
 };
 use crate::format::{read_and_verify_header, write_log_header};
 
 const SHADOW_SHARDS: usize = 2048;
 const SHADOW_SHARDS_MASK: u64 = (SHADOW_SHARDS as u64) - 1;
 const FIB_MUL: u64 = 0x9e3779b97f4a7c15;
+
+// Pass-2 task granularity: each rayon task processes this many bitmap words
+// (= WORDS_PER_GROUP * 64 pages of address space). Small enough for rayon's
+// work stealer to balance dense vs sparse regions; large enough that per-task
+// overhead is negligible next to zstd.
+const WORDS_PER_GROUP: usize = 64;
 
 type ShadowEntry = (u64, Arc<[u8; PAGE_SIZE]>);
 type ShadowShard = RwLock<FxHashMap<u64, ShadowEntry>>;
@@ -29,7 +35,9 @@ impl Shadow {
         let v: Vec<ShadowShard> = (0..SHADOW_SHARDS)
             .map(|_| RwLock::new(FxHashMap::default()))
             .collect();
-        Self { shards: v.into_boxed_slice() }
+        Self {
+            shards: v.into_boxed_slice(),
+        }
     }
 
     #[inline]
@@ -39,7 +47,10 @@ impl Shadow {
     }
 
     fn get(&self, pa: u64) -> Option<ShadowEntry> {
-        self.shard(pa).read().get(&pa).map(|(k, p)| (*k, Arc::clone(p)))
+        self.shard(pa)
+            .read()
+            .get(&pa)
+            .map(|(k, p)| (*k, Arc::clone(p)))
     }
 
     fn insert_if_newer(&self, pa: u64, key: u64, page: Arc<[u8; PAGE_SIZE]>) {
@@ -56,11 +67,15 @@ impl Shadow {
 
 pub struct WriteDb {
     dir: PathBuf,
-    worker_count: usize,
     delta_threshold: u16,
     shadow: Shadow,
     log_file: Mutex<File>,
     blob_files: Vec<Mutex<BlobFile>>,
+    pool: ThreadPool,
+    // Reusable scratch buffers, sized once and kept across save_pages calls.
+    records_buf: Vec<ChunkRecord>,
+    // Exclusive prefix-sum of per-group dirty counts; len = num_groups + 1.
+    offsets_buf: Vec<u32>,
 }
 
 struct BlobFile {
@@ -68,21 +83,43 @@ struct BlobFile {
     offset: u64,
 }
 
-struct Job<'a> {
-    pa: u64,
-    page: &'a [u8; PAGE_SIZE],
-    snapshot_id: u32,
+// Raw pointer wrapper so rayon tasks can write to disjoint indices of
+// records_buf in parallel. Safety contract: each task writes to a distinct
+// index range derived from offsets_buf (an exclusive prefix sum), so no two
+// tasks ever touch the same slot.
+struct RecordsPtr {
+    ptr: *mut ChunkRecord,
+    len: usize,
+}
+
+unsafe impl Send for RecordsPtr {}
+unsafe impl Sync for RecordsPtr {}
+
+impl RecordsPtr {
+    #[inline]
+    unsafe fn write(&self, idx: usize, value: ChunkRecord) {
+        debug_assert!(idx < self.len);
+        unsafe { self.ptr.add(idx).write(value) }
+    }
 }
 
 impl WriteDb {
-    pub fn open(name: impl AsRef<Path>, worker_count: usize, delta_threshold: u16) -> io::Result<Self> {
+    pub fn open(
+        name: impl AsRef<Path>,
+        worker_count: usize,
+        delta_threshold: u16,
+    ) -> io::Result<Self> {
         if worker_count == 0 || worker_count > 255 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "worker_count must be in 1..=255",
             ));
         }
-        let threshold = if delta_threshold == 0 { DEFAULT_DELTA_THRESHOLD } else { delta_threshold };
+        let threshold = if delta_threshold == 0 {
+            DEFAULT_DELTA_THRESHOLD
+        } else {
+            delta_threshold
+        };
         let dir = name.as_ref().to_path_buf();
         fs::create_dir_all(&dir)?;
         fs::create_dir_all(dir.join("blobs"))?;
@@ -116,13 +153,21 @@ impl WriteDb {
             blob_files.push(Mutex::new(bf));
         }
 
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(worker_count)
+            .thread_name(|i| format!("bxdb-writer-{i}"))
+            .build()
+            .map_err(io::Error::other)?;
+
         Ok(Self {
             dir,
-            worker_count,
             delta_threshold: threshold,
             shadow: Shadow::new(),
             log_file: Mutex::new(log_file),
             blob_files,
+            pool,
+            records_buf: Vec::new(),
+            offsets_buf: Vec::new(),
         })
     }
 
@@ -131,7 +176,7 @@ impl WriteDb {
     }
 
     pub fn save_pages(
-        &self,
+        &mut self,
         memory: &[u8],
         dirty_bitmap: &[u64],
         total_page_count: u64,
@@ -157,52 +202,121 @@ impl WriteDb {
                 "dirty_bitmap too short",
             ));
         }
+        if expected_words == 0 {
+            return Ok(());
+        }
 
-        let (tx, rx) = crossbeam_channel::bounded::<Job>(self.worker_count * 8);
-        let records: Mutex<Vec<ChunkRecord>> = Mutex::new(Vec::new());
+        let bitmap = &dirty_bitmap[..expected_words];
+        let num_groups = (expected_words + WORDS_PER_GROUP - 1) / WORDS_PER_GROUP;
 
-        thread::scope(|s| -> io::Result<()> {
-            let mut handles = Vec::with_capacity(self.worker_count);
-            for wid in 0..self.worker_count {
-                let rx = rx.clone();
-                let records = &records;
-                let shadow = &self.shadow;
-                let blob = &self.blob_files[wid];
-                let threshold = self.delta_threshold as usize;
-                handles.push(s.spawn(move || -> io::Result<()> {
-                    let mut local = Vec::new();
-                    while let Ok(job) = rx.recv() {
-                        process_job(job, wid as u8, shadow, blob, threshold, &mut local)?;
+        // Pass 1a (parallel): per-group popcount into offsets_buf[0..num_groups].
+        // Pass 1b (serial):   in-place exclusive prefix sum, then total in slot [num_groups].
+        // The prefix sum is O(num_groups) serial adds (~100 µs for 128K groups);
+        // a log-depth parallel scan isn't worth the complexity at this size.
+        self.offsets_buf.clear();
+        self.offsets_buf.resize(num_groups + 1, 0);
+
+        let pool = &self.pool;
+        {
+            let counts = &mut self.offsets_buf[..num_groups];
+            pool.install(|| {
+                use rayon::prelude::*;
+                counts
+                    .par_iter_mut()
+                    .enumerate()
+                    .for_each(|(group_idx, slot)| {
+                        let start = group_idx * WORDS_PER_GROUP;
+                        let end = ((group_idx + 1) * WORDS_PER_GROUP).min(expected_words);
+                        let mut count: u32 = 0;
+                        for wi in start..end {
+                            let w =
+                                mask_last_word(bitmap[wi], wi, expected_words, total_page_count);
+                            count += w.count_ones();
+                        }
+                        *slot = count;
+                    });
+            });
+        }
+
+        let mut acc: u32 = 0;
+        for slot in self.offsets_buf[..num_groups].iter_mut() {
+            let c = *slot;
+            *slot = acc;
+            acc = acc.checked_add(c).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "dirty count exceeds u32")
+            })?;
+        }
+        self.offsets_buf[num_groups] = acc;
+        let total_dirty = acc as usize;
+
+        if total_dirty == 0 {
+            return Ok(());
+        }
+
+        // Pre-size records_buf without zeroing — pass 2 writes every slot
+        // exactly once via raw pointer. ChunkRecord is Copy (no Drop), so
+        // briefly leaving uninit memory in the Vec is sound as long as we
+        // don't read it before all writes complete.
+        self.records_buf.clear();
+        self.records_buf.reserve(total_dirty);
+        let buf_ptr = RecordsPtr {
+            ptr: self.records_buf.as_mut_ptr(),
+            len: total_dirty,
+        };
+
+        let offsets = &self.offsets_buf;
+        let shadow = &self.shadow;
+        let blob_files = &self.blob_files;
+        let threshold = self.delta_threshold as usize;
+        let blob_count = blob_files.len();
+
+        self.pool.install(|| -> io::Result<()> {
+            use rayon::prelude::*;
+            (0..num_groups)
+                .into_par_iter()
+                .try_for_each(|group_idx| -> io::Result<()> {
+                    let mut write_idx = offsets[group_idx] as usize;
+                    let group_end = offsets[group_idx + 1] as usize;
+                    let start = group_idx * WORDS_PER_GROUP;
+                    let end = ((group_idx + 1) * WORDS_PER_GROUP).min(expected_words);
+
+                    for wi in start..end {
+                        let mut w =
+                            mask_last_word(bitmap[wi], wi, expected_words, total_page_count);
+                        let base = (wi as u64) * 64;
+                        while w != 0 {
+                            let b = w.trailing_zeros() as u64;
+                            let pa = base + b;
+                            let mem_off = (pa * PAGE_SIZE as u64) as usize;
+                            let page: &[u8; PAGE_SIZE] =
+                                memory[mem_off..mem_off + PAGE_SIZE].try_into().unwrap();
+                            let wid = (pa as usize) % blob_count;
+                            let rec = process_one(
+                                pa,
+                                page,
+                                snapshot_id,
+                                wid as u8,
+                                shadow,
+                                &blob_files[wid],
+                                threshold,
+                            )?;
+                            unsafe { buf_ptr.write(write_idx, rec) };
+                            write_idx += 1;
+                            w &= w - 1;
+                        }
                     }
-                    records.lock().extend(local);
+                    debug_assert_eq!(write_idx, group_end);
+                    let _ = group_end;
                     Ok(())
-                }));
-            }
-            drop(rx);
-
-            for i in 0..total_page_count {
-                let word_idx = (i / 64) as usize;
-                let bit = (dirty_bitmap[word_idx] >> (i % 64)) & 1;
-                if bit == 0 {
-                    continue;
-                }
-                let start = (i * PAGE_SIZE as u64) as usize;
-                let page: &[u8; PAGE_SIZE] = memory[start..start + PAGE_SIZE].try_into().unwrap();
-                tx.send(Job { pa: i, page, snapshot_id }).unwrap();
-            }
-            drop(tx);
-
-            for h in handles {
-                h.join().map_err(|_| io::Error::other("worker panicked"))??;
-            }
-            Ok(())
+                })
         })?;
 
-        let records = records.into_inner();
+        // All total_dirty slots have been written exactly once.
+        unsafe { self.records_buf.set_len(total_dirty) };
 
         {
             let mut log = self.log_file.lock();
-            for r in &records {
+            for r in &self.records_buf {
                 r.write_to(&mut *log)?;
             }
             log.sync_all()?;
@@ -214,39 +328,51 @@ impl WriteDb {
     }
 }
 
-fn process_job(
-    job: Job<'_>,
+#[inline]
+fn mask_last_word(w: u64, wi: usize, expected_words: usize, total_page_count: u64) -> u64 {
+    if wi + 1 == expected_words {
+        let valid = total_page_count - (wi as u64) * 64;
+        if valid < 64 {
+            return w & ((1u64 << valid) - 1);
+        }
+    }
+    w
+}
+
+fn process_one(
+    pa: u64,
+    page: &[u8; PAGE_SIZE],
+    snapshot_id: u32,
     worker_id: u8,
     shadow: &Shadow,
     blob: &Mutex<BlobFile>,
     threshold: usize,
-    records: &mut Vec<ChunkRecord>,
-) -> io::Result<()> {
-    let key = encode_key(job.pa, job.snapshot_id);
+) -> io::Result<ChunkRecord> {
+    let key = encode_key(pa, snapshot_id);
 
-    if is_all_zero(job.page) {
-        records.push(ChunkRecord::new_zero(key));
-        return Ok(());
+    if is_all_zero(page) {
+        return Ok(ChunkRecord::new_zero(key));
     }
 
-    if let Some((base_key, base_page)) = shadow.get(job.pa) {
-        let patch = compute_xor_patch(job.page, &base_page);
+    if let Some((base_key, base_page)) = shadow.get(pa) {
+        let patch = compute_xor_patch(page, &base_page);
         if patch.len() <= threshold {
             let data = encode_delta_patch(&patch);
             let (offset, len) = append_blob(blob, &data)?;
-            records.push(ChunkRecord::new_delta(key, worker_id, offset, len, base_key));
-            return Ok(());
+            return Ok(ChunkRecord::new_delta(
+                key, worker_id, offset, len, base_key,
+            ));
         }
     }
 
-    let compressed = zstd::encode_all(&job.page[..], 3)?;
+    let compressed = zstd::encode_all(&page[..], 3)?;
     let (offset, len) = append_blob(blob, &compressed)?;
-    records.push(ChunkRecord::new_full(key, worker_id, offset, len));
+    let rec = ChunkRecord::new_full(key, worker_id, offset, len);
 
     let mut owned = Box::new([0u8; PAGE_SIZE]);
-    owned.copy_from_slice(job.page);
-    shadow.insert_if_newer(job.pa, key, Arc::from(owned));
-    Ok(())
+    owned.copy_from_slice(page);
+    shadow.insert_if_newer(pa, key, Arc::from(owned));
+    Ok(rec)
 }
 
 fn append_blob(blob: &Mutex<BlobFile>, data: &[u8]) -> io::Result<(u64, u32)> {
@@ -254,9 +380,9 @@ fn append_blob(blob: &Mutex<BlobFile>, data: &[u8]) -> io::Result<(u64, u32)> {
     let offset = g.offset;
     g.file.write_all(data)?;
     g.offset += data.len() as u64;
-    let len: u32 = data.len().try_into().map_err(|_| {
-        io::Error::new(io::ErrorKind::InvalidData, "blob too large for u32 len")
-    })?;
+    let len: u32 = data
+        .len()
+        .try_into()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "blob too large for u32 len"))?;
     Ok((offset, len))
 }
-

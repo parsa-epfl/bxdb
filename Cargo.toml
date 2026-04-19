@@ -23,7 +23,7 @@ inspect = ["dep:ratatui", "dep:crossterm"]
 [dependencies]
 zstd = "0.13"
 rustc-hash = "2"
-crossbeam-channel = "0.5"
+rayon = "1"
 parking_lot = "0.12"
 libc = "0.2"
 ratatui = { version = "0.29", optional = true }
