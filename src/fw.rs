@@ -1,7 +1,9 @@
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Seek, SeekFrom, Write};
+use std::io::{self, BufReader, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
 
 use parking_lot::{Mutex, RwLock};
 use rayon::ThreadPool;
@@ -9,9 +11,10 @@ use rustc_hash::FxHashMap;
 
 use crate::chunk::{
     ChunkRecord, DEFAULT_DELTA_THRESHOLD, MAGIC_LOG, MAX_SNAPSHOT_ID, PAGE_SIZE, compute_xor_patch,
-    encode_delta_patch, encode_key, is_all_zero,
+    encode_delta_patch, encode_key, is_all_zero, pa_of, snapshot_of,
 };
 use crate::format::{read_and_verify_header, write_log_header};
+use crate::timing::{IndexMode, PageStore};
 
 const SHADOW_SHARDS: usize = 2048;
 const SHADOW_SHARDS_MASK: u64 = (SHADOW_SHARDS as u64) - 1;
@@ -65,7 +68,7 @@ impl Shadow {
     }
 }
 
-pub struct WriteDb {
+pub struct FwDb {
     dir: PathBuf,
     delta_threshold: u16,
     shadow: Shadow,
@@ -103,7 +106,7 @@ impl RecordsPtr {
     }
 }
 
-impl WriteDb {
+impl FwDb {
     pub fn open(
         name: impl AsRef<Path>,
         worker_count: usize,
@@ -326,6 +329,184 @@ impl WriteDb {
         }
         Ok(())
     }
+
+    pub fn load_all_pages(
+        &self,
+        out: &mut [u8],
+        pa_offset: u64,
+        total_page_count: u64,
+        snapshot_id: u32,
+        worker_count: usize,
+    ) -> io::Result<bool> {
+        if snapshot_id > MAX_SNAPSHOT_ID {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "snapshot_id exceeds 19-bit range",
+            ));
+        }
+        if out.len() as u128 != (total_page_count as u128) * (PAGE_SIZE as u128) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "output length != total_page_count * 4096",
+            ));
+        }
+        let worker_count = worker_count.max(1);
+
+        // A bulk load resolves each PA exactly once, so there is no reuse to
+        // amortize over the SharedCache; open a cache-less PageStore instead.
+        let store = PageStore::open(&self.dir)?;
+
+        match store.mode() {
+            IndexMode::BTree => {
+                load_all_btree(&store, out, pa_offset, total_page_count, snapshot_id, worker_count)
+            }
+            IndexMode::AppendOnly => {
+                let log_path = store
+                    .log_path()
+                    .expect("append-only mode must expose log path");
+                load_all_scan(
+                    &store,
+                    out,
+                    pa_offset,
+                    total_page_count,
+                    snapshot_id,
+                    worker_count,
+                    log_path,
+                )
+            }
+        }
+    }
+}
+
+fn load_all_btree(
+    store: &PageStore,
+    out: &mut [u8],
+    pa_offset: u64,
+    total_page_count: u64,
+    snapshot_id: u32,
+    worker_count: usize,
+) -> io::Result<bool> {
+    let total = total_page_count as usize;
+    let pages_per_worker = (total + worker_count - 1) / worker_count;
+    let success = AtomicBool::new(true);
+
+    thread::scope(|s| -> io::Result<()> {
+        let mut starts = Vec::with_capacity(worker_count);
+        let mut cursor = 0usize;
+        let mut remaining = out;
+        for _ in 0..worker_count {
+            if cursor >= total {
+                break;
+            }
+            let take = pages_per_worker.min(total - cursor);
+            let split = take * PAGE_SIZE;
+            let (head, tail) = remaining.split_at_mut(split);
+            starts.push((cursor, head));
+            remaining = tail;
+            cursor += take;
+        }
+        let mut handles = Vec::with_capacity(starts.len());
+        for (start_idx, slice) in starts {
+            let success_ref = &success;
+            handles.push(s.spawn(move || -> io::Result<()> {
+                for (i, slot) in slice.chunks_exact_mut(PAGE_SIZE).enumerate() {
+                    let pa = pa_offset + (start_idx + i) as u64;
+                    let slot_arr: &mut [u8; PAGE_SIZE] = slot.try_into().unwrap();
+                    match store.floor(pa, snapshot_id)? {
+                        Some(rec) => store.resolve_uncached(&rec, slot_arr)?,
+                        None => {
+                            slot_arr.fill(0);
+                            success_ref.store(false, Ordering::Relaxed);
+                        }
+                    }
+                }
+                Ok(())
+            }));
+        }
+        for h in handles {
+            h.join().map_err(|_| io::Error::other("worker panicked"))??;
+        }
+        Ok(())
+    })?;
+
+    Ok(success.load(Ordering::Relaxed))
+}
+
+fn load_all_scan(
+    store: &PageStore,
+    out: &mut [u8],
+    pa_offset: u64,
+    total_page_count: u64,
+    snapshot_id: u32,
+    worker_count: usize,
+    log_path: &Path,
+) -> io::Result<bool> {
+    // Architecture §9: a single linear scan of chunks.log keeps the record
+    // with the highest snap ≤ snapshot_id per PA in range.
+    let total = total_page_count as usize;
+    let mut latest: Vec<Option<ChunkRecord>> = vec![None; total];
+    let end_pa = pa_offset + total_page_count;
+
+    let file = File::open(log_path)?;
+    let mut r = BufReader::new(file);
+    read_and_verify_header(&mut r, &MAGIC_LOG)?;
+    while let Some(rec) = ChunkRecord::read_from(&mut r)? {
+        let pa = pa_of(rec.key);
+        if pa < pa_offset || pa >= end_pa {
+            continue;
+        }
+        let snap = snapshot_of(rec.key);
+        if snap > snapshot_id {
+            continue;
+        }
+        let slot = (pa - pa_offset) as usize;
+        match &latest[slot] {
+            None => latest[slot] = Some(rec),
+            Some(prev) if snapshot_of(prev.key) < snap => latest[slot] = Some(rec),
+            _ => {}
+        }
+    }
+
+    let success = AtomicBool::new(true);
+    let pages_per_worker = (total + worker_count - 1) / worker_count;
+
+    thread::scope(|s| -> io::Result<()> {
+        let mut cursor = 0usize;
+        let mut remaining = out;
+        let mut handles = Vec::with_capacity(worker_count);
+        let latest = &latest;
+        for _ in 0..worker_count {
+            if cursor >= total {
+                break;
+            }
+            let take = pages_per_worker.min(total - cursor);
+            let split = take * PAGE_SIZE;
+            let (head, tail) = remaining.split_at_mut(split);
+            let start_idx = cursor;
+            let success_ref = &success;
+            cursor += take;
+            remaining = tail;
+            handles.push(s.spawn(move || -> io::Result<()> {
+                for (i, slot) in head.chunks_exact_mut(PAGE_SIZE).enumerate() {
+                    let slot_arr: &mut [u8; PAGE_SIZE] = slot.try_into().unwrap();
+                    match &latest[start_idx + i] {
+                        Some(rec) => store.resolve_uncached(rec, slot_arr)?,
+                        None => {
+                            slot_arr.fill(0);
+                            success_ref.store(false, Ordering::Relaxed);
+                        }
+                    }
+                }
+                Ok(())
+            }));
+        }
+        for h in handles {
+            h.join().map_err(|_| io::Error::other("worker panicked"))??;
+        }
+        Ok(())
+    })?;
+
+    Ok(success.load(Ordering::Relaxed))
 }
 
 #[inline]

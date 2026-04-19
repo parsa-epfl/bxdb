@@ -3,13 +3,13 @@ use std::ptr;
 use std::slice;
 
 use crate::chunk::PAGE_SIZE;
-use crate::read::ReadDb;
-use crate::write::WriteDb;
+use crate::fw::FwDb;
+use crate::timing::TimingDb;
 
 pub enum BxdbHandle {
     Dummy,
-    Write(WriteDb),
-    Read(ReadDb),
+    Fw(FwDb),
+    Timing(TimingDb),
 }
 
 #[unsafe(no_mangle)]
@@ -18,7 +18,7 @@ pub extern "C" fn bxdb_init() -> *mut BxdbHandle {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn bxdb_open_for_write(
+pub unsafe extern "C" fn bxdb_open_for_fw(
     name: *const c_char,
     worker_count: c_int,
     delta_threshold: u16,
@@ -30,14 +30,14 @@ pub unsafe extern "C" fn bxdb_open_for_write(
         Ok(s) => s,
         Err(_) => return ptr::null_mut(),
     };
-    match WriteDb::open(name, worker_count as usize, delta_threshold) {
-        Ok(db) => Box::into_raw(Box::new(BxdbHandle::Write(db))),
+    match FwDb::open(name, worker_count as usize, delta_threshold) {
+        Ok(db) => Box::into_raw(Box::new(BxdbHandle::Fw(db))),
         Err(_) => ptr::null_mut(),
     }
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn bxdb_open_for_read(name: *const c_char) -> *mut BxdbHandle {
+pub unsafe extern "C" fn bxdb_open_for_timing(name: *const c_char) -> *mut BxdbHandle {
     if name.is_null() {
         return ptr::null_mut();
     }
@@ -45,8 +45,8 @@ pub unsafe extern "C" fn bxdb_open_for_read(name: *const c_char) -> *mut BxdbHan
         Ok(s) => s,
         Err(_) => return ptr::null_mut(),
     };
-    match ReadDb::open(name) {
-        Ok(db) => Box::into_raw(Box::new(BxdbHandle::Read(db))),
+    match TimingDb::open(name) {
+        Ok(db) => Box::into_raw(Box::new(BxdbHandle::Timing(db))),
         Err(_) => ptr::null_mut(),
     }
 }
@@ -71,15 +71,15 @@ pub unsafe extern "C" fn bxdb_save_pages(
         return;
     }
     let handle = unsafe { &mut *db };
-    let write_db = match handle {
-        BxdbHandle::Write(w) => w,
+    let fw_db = match handle {
+        BxdbHandle::Fw(w) => w,
         _ => return,
     };
     let mem_len = (total_page_count as usize).saturating_mul(PAGE_SIZE);
     let mem = unsafe { slice::from_raw_parts(memory as *const u8, mem_len) };
     let bitmap_words = ((total_page_count + 63) / 64) as usize;
     let bitmap = unsafe { slice::from_raw_parts(dirty_bitmap, bitmap_words) };
-    let _ = write_db.save_pages(mem, bitmap, total_page_count, snapshot_id);
+    let _ = fw_db.save_pages(mem, bitmap, total_page_count, snapshot_id);
 }
 
 #[unsafe(no_mangle)]
@@ -93,11 +93,11 @@ pub unsafe extern "C" fn bxdb_load_page(
         return false;
     }
     let handle = unsafe { &*db };
-    let read_db = match handle {
-        BxdbHandle::Read(r) => r,
+    let timing_db = match handle {
+        BxdbHandle::Timing(r) => r,
         _ => return false,
     };
-    match read_db.load_page(pa, snapshot_id) {
+    match timing_db.load_page(pa, snapshot_id) {
         Ok(Some(p)) => {
             let out = unsafe { slice::from_raw_parts_mut(page as *mut u8, PAGE_SIZE) };
             out.copy_from_slice(&p);
@@ -120,13 +120,19 @@ pub unsafe extern "C" fn bxdb_load_all_pages(
         return false;
     }
     let handle = unsafe { &*db };
-    let read_db = match handle {
-        BxdbHandle::Read(r) => r,
+    let fw_db = match handle {
+        BxdbHandle::Fw(w) => w,
         _ => return false,
     };
     let len = (total_page_count as usize).saturating_mul(PAGE_SIZE);
     let out = unsafe { slice::from_raw_parts_mut(pages as *mut u8, len) };
-    read_db
-        .load_all_pages(out, pa_offset, total_page_count, snapshot_id, worker_count.max(1) as usize)
+    fw_db
+        .load_all_pages(
+            out,
+            pa_offset,
+            total_page_count,
+            snapshot_id,
+            worker_count.max(1) as usize,
+        )
         .unwrap_or(false)
 }
