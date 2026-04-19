@@ -35,6 +35,8 @@
 
 #define HEADER_SIZE 16
 
+#define LOG_RECORD_BASE_SIZE 22
+
 #define CHUNK_FULL 0
 
 #define CHUNK_DELTA 1
@@ -47,11 +49,9 @@ typedef struct BxdbHandle BxdbHandle;
 
 struct BxdbHandle *bxdb_init(void);
 
-struct BxdbHandle *bxdb_open_for_write(const char *name,
-                                       int worker_count,
-                                       uint16_t delta_threshold);
+struct BxdbHandle *bxdb_open_for_fw(const char *name, int worker_count, uint16_t delta_threshold);
 
-struct BxdbHandle *bxdb_open_for_read(const char *name);
+struct BxdbHandle *bxdb_open_for_timing(const char *name);
 
 void bxdb_close(struct BxdbHandle *db);
 

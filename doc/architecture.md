@@ -48,14 +48,16 @@ pair within the supported ranges.
 /* Initialise the library. Must be called once before any other function. */
 bxdb_t *bxdb_init(void);
 
-/* Open a database in write mode. worker_count sets parallelism for saves.
+/* Open a database in fw (functional-warming) mode. Supports bulk saves
+ * and bulk loads of pages. worker_count sets parallelism for saves.
  * delta_threshold: max non-zero words in a patch before a Full chunk is
  * written instead (default: 256, i.e. half of a 4 KB page). */
-bxdb_t *bxdb_open_for_write(const char *name, int worker_count,
-                             uint16_t delta_threshold);
+bxdb_t *bxdb_open_for_fw(const char *name, int worker_count,
+                          uint16_t delta_threshold);
 
-/* Open a database in read mode (after conversion has been run). */
-bxdb_t *bxdb_open_for_read(const char *name);
+/* Open a database in timing mode (after conversion has been run).
+ * Supports single-page reads only. */
+bxdb_t *bxdb_open_for_timing(const char *name);
 
 /*
  * Save pages for a snapshot. Synchronous — blocks until all dirty pages
@@ -73,7 +75,7 @@ void bxdb_save_pages(bxdb_t         *db,
                      uint32_t        snapshot_id);
 
 /*
- * Load a single page. Synchronous.
+ * Load a single page. Synchronous. Requires a timing-mode handle.
  *
  * Fills page[0..4095] with the content of PA at the largest stored
  * snapshot_id' ≤ snapshot_id. Returns false if no such page exists.
@@ -85,6 +87,7 @@ bool bxdb_load_page(bxdb_t   *db,
 
 /*
  * Load all pages for a snapshot into a contiguous buffer. Synchronous.
+ * Requires an fw-mode handle.
  *
  * pages            - output buffer of total_page_count × 4096 bytes
  * pa_offset        - PA of the first page (pages[0] = PA pa_offset,
