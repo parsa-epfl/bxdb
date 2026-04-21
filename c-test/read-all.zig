@@ -66,7 +66,7 @@ fn populate_memory_and_save_db(memory: []u8, db_name: [:0]u8, mv: [][4096 * 3]u8
 }
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     const allocator = gpa.allocator();
 
     // Init DB.
@@ -76,8 +76,9 @@ pub fn main() !void {
 
     std.debug.print("DB name: {s} \n", .{db_name});
 
+    const io = std.Io.Threaded.global_single_threaded.io();
     // first, delete the old test folder if it exists.
-    std.fs.cwd().deleteTree(db_name) catch |err| {
+    std.Io.Dir.cwd().deleteTree(io, db_name) catch |err| {
         if (err != error.FileNotFound) return err;
     };
 

@@ -2,7 +2,7 @@ const std = @import("std");
 const bxdb = @import("./bxdb.zig");
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     const allocator = gpa.allocator();
 
     const file_name = @src().file;
@@ -11,8 +11,9 @@ pub fn main() !void {
 
     std.debug.print("DB name: {s} \n", .{db_name});
 
+    const io = std.Io.Threaded.global_single_threaded.io();
     // first, delete the old test folder if it exists.
-    std.fs.cwd().deleteTree(db_name) catch |err| {
+    std.Io.Dir.cwd().deleteTree(io, db_name) catch |err| {
         if (err != error.FileNotFound) return err;
     };
 
