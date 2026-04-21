@@ -97,6 +97,8 @@ struct Stats {
     full: usize,
     delta: usize,
     zero: usize,
+    full_bytes: u64,
+    delta_bytes: u64,
 }
 
 impl Stats {
@@ -106,11 +108,19 @@ impl Stats {
             full: 0,
             delta: 0,
             zero: 0,
+            full_bytes: 0,
+            delta_bytes: 0,
         };
         for r in records {
             match r.kind {
-                ChunkKind::Full => s.full += 1,
-                ChunkKind::Delta => s.delta += 1,
+                ChunkKind::Full => {
+                    s.full += 1;
+                    s.full_bytes += r.len as u64;
+                }
+                ChunkKind::Delta => {
+                    s.delta += 1;
+                    s.delta_bytes += r.len as u64;
+                }
                 ChunkKind::Zero => s.zero += 1,
             }
         }
@@ -122,6 +132,29 @@ impl Stats {
         } else {
             (n as f64) * 100.0 / (self.total as f64)
         }
+    }
+    fn total_bytes(&self) -> u64 {
+        self.full_bytes + self.delta_bytes
+    }
+    fn byte_pct(&self, n: u64) -> f64 {
+        let t = self.total_bytes();
+        if t == 0 { 0.0 } else { (n as f64) * 100.0 / (t as f64) }
+    }
+}
+
+fn fmt_bytes(n: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+    let f = n as f64;
+    if f >= GIB {
+        format!("{:.2} GiB", f / GIB)
+    } else if f >= MIB {
+        format!("{:.2} MiB", f / MIB)
+    } else if f >= KIB {
+        format!("{:.2} KiB", f / KIB)
+    } else {
+        format!("{n} B")
     }
 }
 
@@ -303,7 +336,7 @@ fn draw(f: &mut Frame, app: &App) {
     let vert = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(4),
+            Constraint::Length(5),
             Constraint::Min(0),
             Constraint::Length(1),
         ])
@@ -343,6 +376,22 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
             Span::raw(format!("{:>6} ({:5.1}%)   ", s.delta, s.pct(s.delta))),
             Span::styled("Zero ", Style::default().fg(Color::DarkGray)),
             Span::raw(format!("{:>6} ({:5.1}%)", s.zero, s.pct(s.zero))),
+        ]),
+        Line::from(vec![
+            Span::raw("Blob: "),
+            Span::styled("Full ", Style::default().fg(Color::Green)),
+            Span::raw(format!(
+                "{:>10} ({:5.1}%)   ",
+                fmt_bytes(s.full_bytes),
+                s.byte_pct(s.full_bytes)
+            )),
+            Span::styled("Delta ", Style::default().fg(Color::Magenta)),
+            Span::raw(format!(
+                "{:>10} ({:5.1}%)   ",
+                fmt_bytes(s.delta_bytes),
+                s.byte_pct(s.delta_bytes)
+            )),
+            Span::raw(format!("Total {}", fmt_bytes(s.total_bytes()))),
         ]),
     ];
     let p =
