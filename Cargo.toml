@@ -8,6 +8,10 @@ name = "bxdb"
 crate-type = ["rlib", "cdylib", "staticlib"]
 
 [[bin]]
+name = "compress-bench"
+path = "src/bin/compress_bench.rs"
+
+[[bin]]
 name = "bxdb-convert"
 path = "src/bin/bxdb_convert.rs"
 
@@ -22,6 +26,8 @@ inspect = ["dep:ratatui", "dep:crossterm"]
 
 [dependencies]
 zstd = "0.13"
+lz4_flex = "0.11"
+snap = "1"
 rustc-hash = "2"
 rayon = "1"
 parking_lot = "0.12"

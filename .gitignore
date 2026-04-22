@@ -3,3 +3,6 @@ save-full
 save-load-save
 too-many-changes
 read-all
+*.csv
+*.raw
+stress-*

@@ -49,7 +49,7 @@ typedef struct BxdbHandle BxdbHandle;
 
 struct BxdbHandle *bxdb_init(void);
 
-struct BxdbHandle *bxdb_open_for_fw(const char *name, int worker_count, uint16_t delta_threshold);
+struct BxdbHandle *bxdb_open_for_fw(const char *name, int worker_count, uint16_t delta_threshold, bool use_shadow);
 
 struct BxdbHandle *bxdb_open_for_timing(const char *name);
 

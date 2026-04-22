@@ -22,6 +22,7 @@ pub unsafe extern "C" fn bxdb_open_for_fw(
     name: *const c_char,
     worker_count: c_int,
     delta_threshold: u16,
+    use_shadow: bool,
 ) -> *mut BxdbHandle {
     if name.is_null() || worker_count <= 0 {
         return ptr::null_mut();
@@ -30,7 +31,7 @@ pub unsafe extern "C" fn bxdb_open_for_fw(
         Ok(s) => s,
         Err(_) => return ptr::null_mut(),
     };
-    match FwDb::open(name, worker_count as usize, delta_threshold) {
+    match FwDb::open(name, worker_count as usize, delta_threshold, use_shadow) {
         Ok(db) => Box::into_raw(Box::new(BxdbHandle::Fw(db))),
         Err(_) => ptr::null_mut(),
     }

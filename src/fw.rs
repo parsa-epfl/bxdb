@@ -1,8 +1,20 @@
+use std::cell::RefCell;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufReader, Seek, SeekFrom, Write};
+use std::io::{self, BufReader, BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+static TIME_COMPRESS_NS: AtomicU64 = AtomicU64::new(0);
+static TIME_BLOB_WRITE_NS: AtomicU64 = AtomicU64::new(0);
+static TIME_SHADOW_NS: AtomicU64 = AtomicU64::new(0);
+
+thread_local! {
+    // One reusable zstd context per rayon worker thread — avoids allocating and
+    // zeroing a ~1.5 MB hash table on every process_one call.
+    static ZSTD_CTX: RefCell<zstd::bulk::Compressor<'static>> =
+        RefCell::new(zstd::bulk::Compressor::new(3).expect("zstd init"));
+}
 use std::thread;
 
 use parking_lot::{Mutex, RwLock};
@@ -71,6 +83,7 @@ impl Shadow {
 pub struct FwDb {
     dir: PathBuf,
     delta_threshold: u16,
+    use_shadow: bool,
     shadow: Shadow,
     log_file: Mutex<File>,
     blob_files: Vec<Mutex<BlobFile>>,
@@ -111,6 +124,7 @@ impl FwDb {
         name: impl AsRef<Path>,
         worker_count: usize,
         delta_threshold: u16,
+        use_shadow: bool,
     ) -> io::Result<Self> {
         if worker_count == 0 || worker_count > 255 {
             return Err(io::Error::new(
@@ -165,6 +179,7 @@ impl FwDb {
         Ok(Self {
             dir,
             delta_threshold: threshold,
+            use_shadow,
             shadow: Shadow::new(),
             log_file: Mutex::new(log_file),
             blob_files,
@@ -272,7 +287,9 @@ impl FwDb {
         let blob_files = &self.blob_files;
         let threshold = self.delta_threshold as usize;
         let blob_count = blob_files.len();
+        let use_shadow = self.use_shadow;
 
+        let t_pass2 = std::time::Instant::now();
         self.pool.install(|| -> io::Result<()> {
             use rayon::prelude::*;
             (0..num_groups)
@@ -302,6 +319,7 @@ impl FwDb {
                                 shadow,
                                 &blob_files[wid],
                                 threshold,
+                                use_shadow,
                             )?;
                             unsafe { buf_ptr.write(write_idx, rec) };
                             write_idx += 1;
@@ -313,20 +331,39 @@ impl FwDb {
                     Ok(())
                 })
         })?;
+        eprintln!("[TIMING] pass2 (compress+blob_write): {:.3}s", t_pass2.elapsed().as_secs_f64());
+        eprintln!("[TIMING]   compress:    {:.3}s", TIME_COMPRESS_NS.load(Ordering::Relaxed) as f64 / 1e9);
+        eprintln!("[TIMING]   blob_write:  {:.3}s", TIME_BLOB_WRITE_NS.load(Ordering::Relaxed) as f64 / 1e9);
+        eprintln!("[TIMING]   shadow_ops:  {:.3}s", TIME_SHADOW_NS.load(Ordering::Relaxed) as f64 / 1e9);
+        TIME_COMPRESS_NS.store(0, Ordering::Relaxed);
+        TIME_BLOB_WRITE_NS.store(0, Ordering::Relaxed);
+        TIME_SHADOW_NS.store(0, Ordering::Relaxed);
 
         // All total_dirty slots have been written exactly once.
         unsafe { self.records_buf.set_len(total_dirty) };
 
         {
+            let t_log_write = std::time::Instant::now();
             let mut log = self.log_file.lock();
-            for r in &self.records_buf {
-                r.write_to(&mut *log)?;
+            {
+                let mut log_buf = BufWriter::with_capacity(1 << 20, &mut *log);
+                for r in &self.records_buf {
+                    r.write_to(&mut log_buf)?;
+                }
+                log_buf.flush()?;
             }
+            eprintln!("[TIMING] log_write ({} records): {:.3}s", total_dirty, t_log_write.elapsed().as_secs_f64());
+            let t_log_sync = std::time::Instant::now();
             log.sync_all()?;
+            eprintln!("[TIMING] log_sync_all: {:.3}s", t_log_sync.elapsed().as_secs_f64());
         }
-        for bf in &self.blob_files {
+        let t_blob_sync = std::time::Instant::now();
+        for (i, bf) in self.blob_files.iter().enumerate() {
+            let t = std::time::Instant::now();
             bf.lock().file.sync_all()?;
+            eprintln!("[TIMING] blob_sync_all[{i}]: {:.3}s", t.elapsed().as_secs_f64());
         }
+        eprintln!("[TIMING] all_blob_syncs total: {:.3}s", t_blob_sync.elapsed().as_secs_f64());
         Ok(())
     }
 
@@ -528,6 +565,7 @@ fn process_one(
     shadow: &Shadow,
     blob: &Mutex<BlobFile>,
     threshold: usize,
+    use_shadow: bool,
 ) -> io::Result<ChunkRecord> {
     let key = encode_key(pa, snapshot_id);
 
@@ -535,24 +573,35 @@ fn process_one(
         return Ok(ChunkRecord::new_zero(key));
     }
 
-    if let Some((base_key, base_page)) = shadow.get(pa) {
-        let patch = compute_xor_patch(page, &base_page);
-        if patch.len() <= threshold {
-            let data = encode_delta_patch(&patch);
-            let (offset, len) = append_blob(blob, &data)?;
-            return Ok(ChunkRecord::new_delta(
-                key, worker_id, offset, len, base_key,
-            ));
+    if use_shadow {
+        if let Some((base_key, base_page)) = shadow.get(pa) {
+            let patch = compute_xor_patch(page, &base_page);
+            if patch.len() <= threshold {
+                let data = encode_delta_patch(&patch);
+                let (offset, len) = append_blob(blob, &data)?;
+                return Ok(ChunkRecord::new_delta(
+                    key, worker_id, offset, len, base_key,
+                ));
+            }
         }
     }
 
-    let compressed = zstd::encode_all(&page[..], 3)?;
+    let t0 = std::time::Instant::now();
+    let compressed = ZSTD_CTX.with(|c| c.borrow_mut().compress(&page[..]))?;
+    TIME_COMPRESS_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+
+    let t1 = std::time::Instant::now();
     let (offset, len) = append_blob(blob, &compressed)?;
+    TIME_BLOB_WRITE_NS.fetch_add(t1.elapsed().as_nanos() as u64, Ordering::Relaxed);
+
     let rec = ChunkRecord::new_full(key, worker_id, offset, len);
 
-    let mut owned = Box::new([0u8; PAGE_SIZE]);
-    owned.copy_from_slice(page);
-    shadow.insert_if_newer(pa, key, Arc::from(owned));
+    if use_shadow {
+        let t2 = std::time::Instant::now();
+        shadow.insert_if_newer(pa, key, Arc::new(*page));
+        TIME_SHADOW_NS.fetch_add(t2.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+
     Ok(rec)
 }
 

@@ -61,7 +61,7 @@ fn write_read_single_snapshot_btree() {
         pages.push(p);
     }
 
-    let mut wdb = FwDb::open(&dir, 4, 0).unwrap();
+    let mut wdb = FwDb::open(&dir, 4, 0, true).unwrap();
     wdb.save_pages(&memory, &bitmap, n_pages, 7).unwrap();
     drop(wdb);
 
@@ -91,7 +91,7 @@ fn zero_pages_and_reads_without_blob_io() {
         set_dirty(&mut bitmap, i);
     }
 
-    let mut wdb = FwDb::open(&dir, 2, 0).unwrap();
+    let mut wdb = FwDb::open(&dir, 2, 0, true).unwrap();
     wdb.save_pages(&memory, &bitmap, n_pages, 1).unwrap();
     drop(wdb);
 
@@ -127,7 +127,7 @@ fn delta_chain_floor_query_multiple_snapshots() {
         set_dirty(&mut bitmap, i as u64);
     }
 
-    let mut wdb = FwDb::open(&dir, 2, 256).unwrap();
+    let mut wdb = FwDb::open(&dir, 2, 256, true).unwrap();
     wdb.save_pages(&memory, &bitmap, n_pages, 10).unwrap();
 
     // Snapshot 20: modify a few bytes in each page so xor patch is tiny.
@@ -186,7 +186,7 @@ fn threshold_forces_new_full_and_reads_stay_correct() {
     }
 
     // Force small threshold so any non-trivial diff produces a new Full.
-    let mut wdb = FwDb::open(&dir, 1, 4).unwrap();
+    let mut wdb = FwDb::open(&dir, 1, 4, true).unwrap();
     wdb.save_pages(&memory, &bitmap, n_pages, 1).unwrap();
 
     // Snapshot 2: change many bytes → exceeds threshold → new Full base.
@@ -240,7 +240,7 @@ fn load_all_pages_mixed_kinds() {
         set_dirty(&mut bitmap, i as u64);
     }
 
-    let mut wdb = FwDb::open(&dir, 3, 128).unwrap();
+    let mut wdb = FwDb::open(&dir, 3, 128, true).unwrap();
     wdb.save_pages(&memory, &bitmap, n_pages, 100).unwrap();
 
     // Snapshot 200: only modify half the pages (mix of small delta / new random zeroed).
@@ -259,7 +259,7 @@ fn load_all_pages_mixed_kinds() {
     drop(wdb);
 
     convert_to_btree(&dir);
-    let fdb = FwDb::open(&dir, 3, 128).unwrap();
+    let fdb = FwDb::open(&dir, 3, 128, true).unwrap();
 
     let mut out = make_memory(n_pages as usize);
     let ok = fdb
@@ -298,7 +298,7 @@ fn append_only_scan_mode_read_without_conversion() {
         set_dirty(&mut bitmap, i as u64);
     }
 
-    let mut wdb = FwDb::open(&dir, 2, 256).unwrap();
+    let mut wdb = FwDb::open(&dir, 2, 256, true).unwrap();
     wdb.save_pages(&memory, &bitmap, n_pages, 5).unwrap();
     drop(wdb);
 
@@ -327,7 +327,7 @@ fn conversion_is_roundtrippable() {
         set_dirty(&mut bitmap, i as u64);
     }
 
-    let mut wdb = FwDb::open(&dir, 2, 256).unwrap();
+    let mut wdb = FwDb::open(&dir, 2, 256, true).unwrap();
     wdb.save_pages(&memory, &bitmap, n_pages, 42).unwrap();
     drop(wdb);
 
@@ -368,7 +368,7 @@ fn bxdb_convert_binary_runs() {
         set_dirty(&mut bitmap, i);
     }
 
-    let mut wdb = FwDb::open(&dir, 1, 256).unwrap();
+    let mut wdb = FwDb::open(&dir, 1, 256, true).unwrap();
     wdb.save_pages(&memory, &bitmap, n_pages, 1).unwrap();
     drop(wdb);
 
@@ -460,7 +460,7 @@ fn readdb_uses_shared_cache_file() {
         set_page(&mut memory, i, p);
         set_dirty(&mut bitmap, i as u64);
     }
-    let mut wdb = FwDb::open(&dir, 1, 256).unwrap();
+    let mut wdb = FwDb::open(&dir, 1, 256, true).unwrap();
     wdb.save_pages(&memory, &bitmap, n_pages, 1).unwrap();
     drop(wdb);
     convert_to_btree(&dir);
