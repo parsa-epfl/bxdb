@@ -23,6 +23,7 @@ required-features = ["inspect"]
 [features]
 default = []
 inspect = ["dep:ratatui", "dep:crossterm"]
+timing = []
 
 [dependencies]
 zstd = "0.13"

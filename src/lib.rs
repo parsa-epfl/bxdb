@@ -1,3 +1,14 @@
+// Enable per-phase timing output by building with `--features timing`
+// (e.g. `cargo build --release --features timing`).
+// All [TIMING] eprintln instrumentation is compiled out by default.
+#[macro_export]
+macro_rules! timeit {
+    ($($tt:tt)*) => {
+        #[cfg(feature = "timing")]
+        { $($tt)* }
+    };
+}
+
 pub mod c_api;
 pub mod cache;
 pub mod chunk;

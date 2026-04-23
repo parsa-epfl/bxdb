@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader};
 use std::os::fd::AsRawFd;
@@ -5,6 +6,11 @@ use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::{Arc, OnceLock};
+
+thread_local! {
+    static ZSTD_DEC: RefCell<zstd::bulk::Decompressor<'static>> =
+        RefCell::new(zstd::bulk::Decompressor::new().expect("zstd decompressor init"));
+}
 
 use parking_lot::RwLock;
 use rustc_hash::FxHashMap;
@@ -223,7 +229,8 @@ impl PageStore {
         out: &mut [u8; PAGE_SIZE],
     ) -> io::Result<()> {
         let blob = self.blob_readers.read(rec.worker_id, rec.offset, rec.len)?;
-        let decompressed = zstd::decode_all(&blob[..])?;
+        let decompressed =
+            ZSTD_DEC.with(|d| d.borrow_mut().decompress(&blob, PAGE_SIZE + 1))?;
         if decompressed.len() != PAGE_SIZE {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,

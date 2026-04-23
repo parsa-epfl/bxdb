@@ -3,10 +3,17 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(feature = "timing")]
+use std::sync::atomic::AtomicU64;
+#[cfg(feature = "timing")]
+use libc;
 
+#[cfg(feature = "timing")]
 static TIME_COMPRESS_NS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "timing")]
 static TIME_BLOB_WRITE_NS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "timing")]
 static TIME_SHADOW_NS: AtomicU64 = AtomicU64::new(0);
 
 thread_local! {
@@ -289,6 +296,7 @@ impl FwDb {
         let blob_count = blob_files.len();
         let use_shadow = self.use_shadow;
 
+        #[cfg(feature = "timing")]
         let t_pass2 = std::time::Instant::now();
         self.pool.install(|| -> io::Result<()> {
             use rayon::prelude::*;
@@ -331,18 +339,22 @@ impl FwDb {
                     Ok(())
                 })
         })?;
-        eprintln!("[TIMING] pass2 (compress+blob_write): {:.3}s", t_pass2.elapsed().as_secs_f64());
-        eprintln!("[TIMING]   compress:    {:.3}s", TIME_COMPRESS_NS.load(Ordering::Relaxed) as f64 / 1e9);
-        eprintln!("[TIMING]   blob_write:  {:.3}s", TIME_BLOB_WRITE_NS.load(Ordering::Relaxed) as f64 / 1e9);
-        eprintln!("[TIMING]   shadow_ops:  {:.3}s", TIME_SHADOW_NS.load(Ordering::Relaxed) as f64 / 1e9);
-        TIME_COMPRESS_NS.store(0, Ordering::Relaxed);
-        TIME_BLOB_WRITE_NS.store(0, Ordering::Relaxed);
-        TIME_SHADOW_NS.store(0, Ordering::Relaxed);
+        #[cfg(feature = "timing")]
+        {
+            eprintln!("[TIMING] pass2 (compress+blob_write): {:.3}s", t_pass2.elapsed().as_secs_f64());
+            eprintln!("[TIMING]   compress:    {:.3}s", TIME_COMPRESS_NS.load(Ordering::Relaxed) as f64 / 1e9);
+            eprintln!("[TIMING]   blob_write:  {:.3}s", TIME_BLOB_WRITE_NS.load(Ordering::Relaxed) as f64 / 1e9);
+            eprintln!("[TIMING]   shadow_ops:  {:.3}s", TIME_SHADOW_NS.load(Ordering::Relaxed) as f64 / 1e9);
+            TIME_COMPRESS_NS.store(0, Ordering::Relaxed);
+            TIME_BLOB_WRITE_NS.store(0, Ordering::Relaxed);
+            TIME_SHADOW_NS.store(0, Ordering::Relaxed);
+        }
 
         // All total_dirty slots have been written exactly once.
         unsafe { self.records_buf.set_len(total_dirty) };
 
         {
+            #[cfg(feature = "timing")]
             let t_log_write = std::time::Instant::now();
             let mut log = self.log_file.lock();
             {
@@ -352,18 +364,39 @@ impl FwDb {
                 }
                 log_buf.flush()?;
             }
+            #[cfg(feature = "timing")]
             eprintln!("[TIMING] log_write ({} records): {:.3}s", total_dirty, t_log_write.elapsed().as_secs_f64());
+            #[cfg(feature = "timing")]
             let t_log_sync = std::time::Instant::now();
             log.sync_all()?;
+            #[cfg(feature = "timing")]
             eprintln!("[TIMING] log_sync_all: {:.3}s", t_log_sync.elapsed().as_secs_f64());
         }
+        #[cfg(feature = "timing")]
         let t_blob_sync = std::time::Instant::now();
-        for (i, bf) in self.blob_files.iter().enumerate() {
-            let t = std::time::Instant::now();
-            bf.lock().file.sync_all()?;
-            eprintln!("[TIMING] blob_sync_all[{i}]: {:.3}s", t.elapsed().as_secs_f64());
+        #[cfg(feature = "timing")]
+        let cpu_ns_before = process_cpu_ns();
+        {
+            use rayon::prelude::*;
+            self.blob_files
+                .par_iter()
+                .enumerate()
+                .map(|(_i, bf): (usize, _)| {
+                    #[cfg(feature = "timing")]
+                    let (i, t) = (_i, std::time::Instant::now());
+                    bf.lock().file.sync_all()?;
+                    #[cfg(feature = "timing")]
+                    eprintln!("[TIMING] blob_sync_all[{i}]: {:.3}s", t.elapsed().as_secs_f64());
+                    Ok::<_, io::Error>(())
+                })
+                .collect::<io::Result<Vec<_>>>()?;
         }
-        eprintln!("[TIMING] all_blob_syncs total: {:.3}s", t_blob_sync.elapsed().as_secs_f64());
+        #[cfg(feature = "timing")]
+        {
+            let wall_s = t_blob_sync.elapsed().as_secs_f64();
+            let cpu_s = (process_cpu_ns() - cpu_ns_before) as f64 / 1e9;
+            eprintln!("[TIMING] all_blob_syncs total: {wall_s:.3}s  cpu: {cpu_s:.3}s  ({:.1}% CPU)", cpu_s / wall_s * 100.0);
+        }
         Ok(())
     }
 
@@ -586,23 +619,36 @@ fn process_one(
         }
     }
 
+    #[cfg(feature = "timing")]
     let t0 = std::time::Instant::now();
     let compressed = ZSTD_CTX.with(|c| c.borrow_mut().compress(&page[..]))?;
+    #[cfg(feature = "timing")]
     TIME_COMPRESS_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
+    #[cfg(feature = "timing")]
     let t1 = std::time::Instant::now();
     let (offset, len) = append_blob(blob, &compressed)?;
+    #[cfg(feature = "timing")]
     TIME_BLOB_WRITE_NS.fetch_add(t1.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
     let rec = ChunkRecord::new_full(key, worker_id, offset, len);
 
     if use_shadow {
+        #[cfg(feature = "timing")]
         let t2 = std::time::Instant::now();
         shadow.insert_if_newer(pa, key, Arc::new(*page));
+        #[cfg(feature = "timing")]
         TIME_SHADOW_NS.fetch_add(t2.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
 
     Ok(rec)
+}
+
+#[cfg(feature = "timing")]
+fn process_cpu_ns() -> u64 {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, &mut ts) };
+    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
 }
 
 fn append_blob(blob: &Mutex<BlobFile>, data: &[u8]) -> io::Result<(u64, u32)> {
