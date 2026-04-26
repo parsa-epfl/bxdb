@@ -138,6 +138,18 @@ fn write_log_file(dir: &Path, records: &[ChunkRecord], max_snap: u32) -> io::Res
     let log_path = dir.join("chunks.log");
     let tmp_path = log_path.with_extension("log.tmp");
 
+    // Group records by snapshot_id so the output log preserves the
+    // monotonic snapshot invariant (same order save_pages produces).
+    let mut by_snap: FxHashMap<u32, Vec<ChunkRecord>> = FxHashMap::default();
+    for rec in records {
+        by_snap.entry(snapshot_of(rec.key)).or_default().push(*rec);
+    }
+    let mut snaps: Vec<u32> = by_snap.keys().copied().collect();
+    snaps.sort_unstable();
+    for group in by_snap.values_mut() {
+        group.sort_by_key(|r| r.key);
+    }
+
     {
         let f = OpenOptions::new()
             .create(true)
@@ -146,8 +158,10 @@ fn write_log_file(dir: &Path, records: &[ChunkRecord], max_snap: u32) -> io::Res
             .open(&tmp_path)?;
         let mut w = BufWriter::new(f);
         write_log_header(&mut w, max_snap)?;
-        for rec in records {
-            rec.write_to(&mut w)?;
+        for snap in &snaps {
+            for rec in by_snap.get(snap).unwrap() {
+                rec.write_to(&mut w)?;
+            }
         }
         w.flush()?;
         w.get_ref().sync_all()?;

@@ -2,6 +2,8 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
+use rustc_hash::FxHashMap;
+
 use crate::chunk::{
     ChunkRecord, FIXED_RECORD_SIZE, HEADER_SIZE, LOG_RECORD_BASE_SIZE, MAGIC_IDX, MAGIC_LOG,
     snapshot_of,
@@ -72,6 +74,18 @@ pub fn to_log(dir: &Path) -> io::Result<()> {
 
     let max_snap = records.iter().map(|r| snapshot_of(r.key)).max().unwrap_or(0);
 
+    // Group records by snapshot_id so the output log preserves the
+    // monotonic snapshot invariant (same order save_pages produces).
+    let mut by_snap: FxHashMap<u32, Vec<ChunkRecord>> = FxHashMap::default();
+    for rec in records {
+        by_snap.entry(snapshot_of(rec.key)).or_default().push(rec);
+    }
+    let mut snaps: Vec<u32> = by_snap.keys().copied().collect();
+    snaps.sort_unstable();
+    for group in by_snap.values_mut() {
+        group.sort_by_key(|r| r.key);
+    }
+
     let tmp = log_path.with_extension("log.tmp");
     {
         let f = OpenOptions::new()
@@ -81,8 +95,10 @@ pub fn to_log(dir: &Path) -> io::Result<()> {
             .open(&tmp)?;
         let mut w = BufWriter::new(f);
         write_log_header(&mut w, max_snap)?;
-        for rec in &records {
-            rec.write_to(&mut w)?;
+        for snap in &snaps {
+            for rec in by_snap.get(snap).unwrap() {
+                rec.write_to(&mut w)?;
+            }
         }
         w.flush()?;
         w.get_ref().sync_all()?;
