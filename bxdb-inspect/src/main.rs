@@ -33,7 +33,7 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     }
     let dir = PathBuf::from(&args[1]);
-    let (mode, records) = match load_records(&dir) {
+    let (mode, records, max_snap) = match load_records(&dir) {
         Ok(x) => x,
         Err(e) => {
             eprintln!("bxdb-inspect: {e}");
@@ -41,7 +41,7 @@ fn main() -> ExitCode {
         }
     };
     let stats = Stats::from_records(&records);
-    let app = App::new(dir, mode, records, stats);
+    let app = App::new(dir, mode, records, stats, max_snap);
     if let Err(e) = run(app) {
         eprintln!("bxdb-inspect: {e}");
         return ExitCode::FAILURE;
@@ -51,14 +51,14 @@ fn main() -> ExitCode {
 
 // --- data loading -----------------------------------------------------------
 
-fn load_records(dir: &Path) -> io::Result<(IndexMode, Vec<ChunkRecord>)> {
+fn load_records(dir: &Path) -> io::Result<(IndexMode, Vec<ChunkRecord>, u32)> {
     let idx_path = dir.join("index.bxdb");
     let log_path = dir.join("chunks.log");
     if idx_path.exists() {
         let f = File::open(&idx_path)?;
         let meta = f.metadata()?;
         let mut r = BufReader::new(f);
-        read_and_verify_header(&mut r, &MAGIC_IDX)?;
+        let max_snap = read_and_verify_header(&mut r, &MAGIC_IDX)?;
         let capacity = (meta.len().saturating_sub(HEADER_SIZE as u64)
             / FIXED_RECORD_SIZE as u64) as usize;
         let mut records = Vec::with_capacity(capacity);
@@ -70,12 +70,12 @@ fn load_records(dir: &Path) -> io::Result<(IndexMode, Vec<ChunkRecord>)> {
                 Err(e) => return Err(e),
             }
         }
-        Ok((IndexMode::BTree, records))
+        Ok((IndexMode::BTree, records, max_snap))
     } else if log_path.exists() {
         let f = File::open(&log_path)?;
         let meta = f.metadata()?;
         let mut r = BufReader::new(f);
-        read_and_verify_header(&mut r, &MAGIC_LOG)?;
+        let max_snap = read_and_verify_header(&mut r, &MAGIC_LOG)?;
         let capacity = (meta.len().saturating_sub(HEADER_SIZE as u64)
             / LOG_RECORD_BASE_SIZE as u64) as usize;
         let mut records = Vec::with_capacity(capacity);
@@ -83,7 +83,7 @@ fn load_records(dir: &Path) -> io::Result<(IndexMode, Vec<ChunkRecord>)> {
             records.push(rec);
         }
         records.sort_by_key(|r| r.key);
-        Ok((IndexMode::AppendOnly, records))
+        Ok((IndexMode::AppendOnly, records, max_snap))
     } else {
         Err(io::Error::new(
             io::ErrorKind::NotFound,
@@ -165,6 +165,7 @@ struct App {
     mode: IndexMode,
     records: Vec<ChunkRecord>,
     stats: Stats,
+    max_snapshot: u32,
     list_state: ListState,
     blob_files: FxHashMap<u8, File>,
     detail_scroll: u16,
@@ -179,7 +180,7 @@ enum Detail {
 }
 
 impl App {
-    fn new(dir: PathBuf, mode: IndexMode, records: Vec<ChunkRecord>, stats: Stats) -> Self {
+    fn new(dir: PathBuf, mode: IndexMode, records: Vec<ChunkRecord>, stats: Stats, max_snapshot: u32) -> Self {
         let mut list_state = ListState::default();
         if !records.is_empty() {
             list_state.select(Some(0));
@@ -189,6 +190,7 @@ impl App {
             mode,
             records,
             stats,
+            max_snapshot,
             list_state,
             blob_files: FxHashMap::default(),
             detail_scroll: 0,
@@ -368,6 +370,7 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
             Span::raw("   Mode: "),
             Span::styled(mode, Style::default().fg(Color::Yellow)),
             Span::raw(format!("   Records: {}", s.total)),
+            Span::raw(format!("   Max snapshot: {}", app.max_snapshot)),
         ]),
         Line::from(vec![
             Span::styled("Full ", Style::default().fg(Color::Green)),
