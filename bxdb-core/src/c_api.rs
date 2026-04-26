@@ -3,13 +3,13 @@ use std::ptr;
 use std::slice;
 
 use crate::chunk::PAGE_SIZE;
-use crate::fw::FwDb;
-use crate::timing::TimingDb;
+use crate::append_only::AppendOnlyDb;
+use crate::btree::BtreeDb;
 
 pub enum BxdbHandle {
     Dummy,
-    Fw(FwDb),
-    Timing(TimingDb),
+    AppendOnly(AppendOnlyDb),
+    Btree(BtreeDb),
 }
 
 #[unsafe(no_mangle)]
@@ -18,7 +18,7 @@ pub extern "C" fn bxdb_init() -> *mut BxdbHandle {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn bxdb_open_for_fw(
+pub unsafe extern "C" fn bxdb_open_for_append_only(
     name: *const c_char,
     worker_count: c_int,
     delta_threshold: u16,
@@ -31,14 +31,14 @@ pub unsafe extern "C" fn bxdb_open_for_fw(
         Ok(s) => s,
         Err(_) => return ptr::null_mut(),
     };
-    match FwDb::open(name, worker_count as usize, delta_threshold, use_shadow) {
-        Ok(db) => Box::into_raw(Box::new(BxdbHandle::Fw(db))),
+    match AppendOnlyDb::open(name, worker_count as usize, delta_threshold, use_shadow) {
+        Ok(db) => Box::into_raw(Box::new(BxdbHandle::AppendOnly(db))),
         Err(_) => ptr::null_mut(),
     }
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn bxdb_open_for_timing(name: *const c_char) -> *mut BxdbHandle {
+pub unsafe extern "C" fn bxdb_open_for_btree(name: *const c_char) -> *mut BxdbHandle {
     if name.is_null() {
         return ptr::null_mut();
     }
@@ -46,8 +46,8 @@ pub unsafe extern "C" fn bxdb_open_for_timing(name: *const c_char) -> *mut BxdbH
         Ok(s) => s,
         Err(_) => return ptr::null_mut(),
     };
-    match TimingDb::open(name) {
-        Ok(db) => Box::into_raw(Box::new(BxdbHandle::Timing(db))),
+    match BtreeDb::open(name) {
+        Ok(db) => Box::into_raw(Box::new(BxdbHandle::Btree(db))),
         Err(_) => ptr::null_mut(),
     }
 }
@@ -72,15 +72,15 @@ pub unsafe extern "C" fn bxdb_save_pages(
         return;
     }
     let handle = unsafe { &mut *db };
-    let fw_db = match handle {
-        BxdbHandle::Fw(w) => w,
+    let append_db = match handle {
+        BxdbHandle::AppendOnly(w) => w,
         _ => return,
     };
     let mem_len = (total_page_count as usize).saturating_mul(PAGE_SIZE);
     let mem = unsafe { slice::from_raw_parts(memory as *const u8, mem_len) };
     let bitmap_words = ((total_page_count + 63) / 64) as usize;
     let bitmap = unsafe { slice::from_raw_parts(dirty_bitmap, bitmap_words) };
-    let _ = fw_db.save_pages(mem, bitmap, total_page_count, snapshot_id);
+    let _ = append_db.save_pages(mem, bitmap, total_page_count, snapshot_id);
 }
 
 #[unsafe(no_mangle)]
@@ -94,11 +94,11 @@ pub unsafe extern "C" fn bxdb_load_page(
         return false;
     }
     let handle = unsafe { &*db };
-    let timing_db = match handle {
-        BxdbHandle::Timing(r) => r,
+    let btree_db = match handle {
+        BxdbHandle::Btree(r) => r,
         _ => return false,
     };
-    match timing_db.load_page(pa, snapshot_id) {
+    match btree_db.load_page(pa, snapshot_id) {
         Ok(Some(p)) => {
             let out = unsafe { slice::from_raw_parts_mut(page as *mut u8, PAGE_SIZE) };
             out.copy_from_slice(&p);
@@ -121,13 +121,13 @@ pub unsafe extern "C" fn bxdb_load_all_pages(
         return false;
     }
     let handle = unsafe { &*db };
-    let fw_db = match handle {
-        BxdbHandle::Fw(w) => w,
+    let append_db = match handle {
+        BxdbHandle::AppendOnly(w) => w,
         _ => return false,
     };
     let len = (total_page_count as usize).saturating_mul(PAGE_SIZE);
     let out = unsafe { slice::from_raw_parts_mut(pages as *mut u8, len) };
-    fw_db
+    append_db
         .load_all_pages(
             out,
             pa_offset,

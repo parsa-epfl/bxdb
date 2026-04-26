@@ -17,7 +17,7 @@ pub fn main() !void {
         if (err != error.FileNotFound) return err;
     };
 
-    const db = bxdb.bxdb_open_for_fw(db_name.ptr, 1, 0) orelse return error.OpenFailed;
+    const db = bxdb.bxdb_open_for_append_only(db_name.ptr, 1, 0, true) orelse return error.OpenFailed;
 
     const memory: []u8 = try allocator.alloc(u8, 4096 * 64);
     defer allocator.free(memory);
@@ -54,7 +54,7 @@ pub fn main() !void {
     bxdb.bxdb_close(db);
 
     // Then, we read this DB again.
-    const db2 = bxdb.bxdb_open_for_fw(db_name.ptr, 1, 0) orelse return error.OpenFailed;
+    const db2 = bxdb.bxdb_open_for_append_only(db_name.ptr, 1, 0, true) orelse return error.OpenFailed;
     defer bxdb.bxdb_close(db2);
 
     memory[3] = 50;

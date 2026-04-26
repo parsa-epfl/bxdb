@@ -28,8 +28,8 @@ pub enum IndexMode {
     AppendOnly,
 }
 
-// Cache-less reader primitives shared by TimingDb (single-page, cached) and
-// FwDb::load_all_pages (bulk load, uncached: each PA is resolved exactly once
+// Cache-less reader primitives shared by BtreeDb (single-page, cached) and
+// AppendOnlyDb::load_all_pages (bulk load, uncached: each PA is resolved exactly once
 // per call so caching only adds overhead).
 pub(crate) struct PageStore {
     source: IndexSource,
@@ -278,13 +278,13 @@ impl PageStore {
     }
 }
 
-pub struct TimingDb {
+pub struct BtreeDb {
     _dir: PathBuf,
     store: PageStore,
     cache: SharedCache,
 }
 
-impl TimingDb {
+impl BtreeDb {
     pub fn open(name: impl AsRef<Path>) -> io::Result<Self> {
         let dir = name.as_ref().to_path_buf();
         let store = PageStore::open(&dir)?;

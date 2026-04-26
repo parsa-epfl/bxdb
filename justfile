@@ -1,10 +1,10 @@
 zig := "/home/sqlin/.zvm/bin/zig"
 
 build-so:
-    cargo build --release
+    cargo build -p bxdb-core --release
 
 build-inspect:
-    cargo build --bin bxdb-inspect --features inspect --release
+    cargo build -p bxdb-inspect --release
 
 gen-header:
     cbindgen -l c --output c-test/bxdb.h

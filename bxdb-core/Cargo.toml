@@ -1,0 +1,29 @@
+[package]
+name = "bxdb-core"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "bxdb"
+crate-type = ["rlib", "cdylib", "staticlib"]
+
+[[bin]]
+name = "compress-bench"
+path = "src/bin/compress_bench.rs"
+
+[features]
+default = []
+timing = []
+
+[dependencies]
+zstd = "0.13"
+lz4_flex = "0.11"
+snap = "1"
+rustc-hash = "2"
+rayon = "1"
+parking_lot = "0.12"
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+rand = "0.8"

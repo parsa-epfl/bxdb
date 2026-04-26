@@ -139,7 +139,7 @@ pub fn main() !void {
     // -------------------------------------------------------------------------
     deleteDbDir("stress-snapdiff-64w");
     {
-        const db = bxdb.bxdb_open_for_fw(DB_64W, 64, 256, true) orelse return error.OpenFailed;
+        const db = bxdb.bxdb_open_for_append_only(DB_64W, 64, 256, true) orelse return error.OpenFailed;
         defer bxdb.bxdb_close(db);
 
         bxdb.bxdb_save_pages(db, src.ptr, snap0_bitmap.ptr, TOTAL_PAGES, 0);
@@ -156,7 +156,7 @@ pub fn main() !void {
     // -------------------------------------------------------------------------
     deleteDbDir("stress-snapdiff-1w");
     {
-        const db = bxdb.bxdb_open_for_fw(DB_1W, 1, 256, true) orelse return error.OpenFailed;
+        const db = bxdb.bxdb_open_for_append_only(DB_1W, 1, 256, true) orelse return error.OpenFailed;
         defer bxdb.bxdb_close(db);
 
         bxdb.bxdb_save_pages(db, src.ptr, snap0_bitmap.ptr, TOTAL_PAGES, 0);
@@ -172,13 +172,13 @@ pub fn main() !void {
     // Verify all four load combinations
     // -------------------------------------------------------------------------
     {
-        const db = bxdb.bxdb_open_for_fw(DB_64W, 64, 256, true) orelse return error.OpenFailed;
+        const db = bxdb.bxdb_open_for_append_only(DB_64W, 64, 256, true) orelse return error.OpenFailed;
         defer bxdb.bxdb_close(db);
         try verifyLoad(db, 0, 64, load_buf, src, "64w DB snap=0 load 64w");
         try verifyLoad(db, 1, 64, load_buf, snap1_mem, "64w DB snap=1 load 64w");
     }
     {
-        const db = bxdb.bxdb_open_for_fw(DB_1W, 1, 256, true) orelse return error.OpenFailed;
+        const db = bxdb.bxdb_open_for_append_only(DB_1W, 1, 256, true) orelse return error.OpenFailed;
         defer bxdb.bxdb_close(db);
         try verifyLoad(db, 0, 1, load_buf, src, "1w DB snap=0 load 1w");
         try verifyLoad(db, 1, 1, load_buf, snap1_mem, "1w DB snap=1 load 1w");

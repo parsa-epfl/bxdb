@@ -21,20 +21,36 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c4512299f36f043ab09a583e57bceb5a5aab7a73db1805848e8fef3c9e8c78b3"
 
 [[package]]
-name = "bxdb"
+name = "bxdb-core"
 version = "0.1.0"
 dependencies = [
- "crossterm",
  "libc",
  "lz4_flex",
  "parking_lot",
  "rand",
- "ratatui",
  "rayon",
  "rustc-hash",
  "snap",
  "tempfile",
  "zstd",
+]
+
+[[package]]
+name = "bxdb-inspect"
+version = "0.1.0"
+dependencies = [
+ "bxdb-core",
+ "crossterm",
+ "ratatui",
+ "rustc-hash",
+ "zstd",
+]
+
+[[package]]
+name = "bxdb-util"
+version = "0.1.0"
+dependencies = [
+ "bxdb-core",
 ]
 
 [[package]]

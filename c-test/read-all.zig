@@ -21,7 +21,7 @@ fn populate_memory_and_save_db(memory: []u8, db_name: [:0]u8, mv: [][4096 * 3]u8
     var snapshot_id: u32 = 0;
 
     // create the db.
-    const db = bxdb.bxdb_open_for_fw(db_name, 1, 0);
+    const db = bxdb.bxdb_open_for_append_only(db_name, 1, 0, true);
     defer bxdb.bxdb_close(db);
 
     // save a version.
@@ -95,7 +95,7 @@ pub fn main() !void {
     // Nice. Now, let's load the version one by one to understand it.
     for (0..4) |id| {
         // load the DB.
-        const db = bxdb.bxdb_open_for_fw(db_name, 1, 0);
+        const db = bxdb.bxdb_open_for_append_only(db_name, 1, 0, true);
 
         const temporal_buf = try allocator.alloc(u8, 4096 * 3);
         defer allocator.free(temporal_buf);

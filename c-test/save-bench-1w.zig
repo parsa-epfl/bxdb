@@ -32,7 +32,7 @@ pub fn main() !void {
     defer posix.munmap(src);
 
     deleteDbDir("save-bench-1w-db");
-    const db = bxdb.bxdb_open_for_fw(DB_1W, 1, 256, false) orelse return error.OpenFailed;
+    const db = bxdb.bxdb_open_for_append_only(DB_1W, 1, 256, false) orelse return error.OpenFailed;
     defer bxdb.bxdb_close(db);
 
     std.debug.print("Starting 1-worker save (32 GiB)...\n", .{});

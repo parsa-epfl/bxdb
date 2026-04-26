@@ -1,8 +1,8 @@
 pub const BxdbHandle = opaque {};
 
 pub extern fn bxdb_init() ?*BxdbHandle;
-pub extern fn bxdb_open_for_fw(name: [*:0]const u8, worker_count: i32, delta_threshold: u16, use_shadow: bool) ?*BxdbHandle;
-pub extern fn bxdb_open_for_timing(name: [*:0]const u8) ?*BxdbHandle;
+pub extern fn bxdb_open_for_append_only(name: [*:0]const u8, worker_count: i32, delta_threshold: u16, use_shadow: bool) ?*BxdbHandle;
+pub extern fn bxdb_open_for_btree(name: [*:0]const u8) ?*BxdbHandle;
 pub extern fn bxdb_close(db: ?*BxdbHandle) void;
 pub extern fn bxdb_save_pages(
     db: ?*BxdbHandle,

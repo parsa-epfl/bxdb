@@ -94,7 +94,7 @@ pub fn main() !void {
     // --- Save with 64 workers ---
     deleteDbDir("stress-save-64w");
     {
-        const db = bxdb.bxdb_open_for_fw(DB_64W, 64, 256, false) orelse return error.OpenFailed;
+        const db = bxdb.bxdb_open_for_append_only(DB_64W, 64, 256, false) orelse return error.OpenFailed;
         defer bxdb.bxdb_close(db);
         const t0 = nanotime();
         bxdb.bxdb_save_pages(db, src.ptr, bitmap.ptr, TOTAL_PAGES, 0);
@@ -105,7 +105,7 @@ pub fn main() !void {
     // --- Save with 1 worker ---
     deleteDbDir("stress-save-1w");
     {
-        const db = bxdb.bxdb_open_for_fw(DB_1W, 1, 256, false) orelse return error.OpenFailed;
+        const db = bxdb.bxdb_open_for_append_only(DB_1W, 1, 256, false) orelse return error.OpenFailed;
         defer bxdb.bxdb_close(db);
         const t0 = nanotime();
         bxdb.bxdb_save_pages(db, src.ptr, bitmap.ptr, TOTAL_PAGES, 0);
@@ -115,7 +115,7 @@ pub fn main() !void {
 
     // --- Load 64w DB with 1 worker, compare ---
     {
-        const db = bxdb.bxdb_open_for_fw(DB_64W, 1, 256, false) orelse return error.OpenFailed;
+        const db = bxdb.bxdb_open_for_append_only(DB_64W, 1, 256, false) orelse return error.OpenFailed;
         defer bxdb.bxdb_close(db);
         const ok = bxdb.bxdb_load_all_pages(db, load_buf.ptr, 0, TOTAL_PAGES, 0, 1);
         if (!ok) return error.LoadFailed;
@@ -128,7 +128,7 @@ pub fn main() !void {
 
     // --- Load 1w DB with 64 workers, compare ---
     {
-        const db = bxdb.bxdb_open_for_fw(DB_1W, 64, 256, false) orelse return error.OpenFailed;
+        const db = bxdb.bxdb_open_for_append_only(DB_1W, 64, 256, false) orelse return error.OpenFailed;
         defer bxdb.bxdb_close(db);
         const ok = bxdb.bxdb_load_all_pages(db, load_buf.ptr, 0, TOTAL_PAGES, 0, 64);
         if (!ok) return error.LoadFailed;

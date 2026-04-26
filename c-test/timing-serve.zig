@@ -44,7 +44,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const db_path_z = try allocator.dupeZ(u8, db_path);
     defer allocator.free(db_path_z);
 
-    const db = bxdb.bxdb_open_for_timing(db_path_z.ptr) orelse return error.OpenFailed;
+    const db = bxdb.bxdb_open_for_btree(db_path_z.ptr) orelse return error.OpenFailed;
     defer bxdb.bxdb_close(db);
 
     var rng = std.Random.DefaultPrng.init(@as(u64, process_id) *% 0xdeadbeef + 1);

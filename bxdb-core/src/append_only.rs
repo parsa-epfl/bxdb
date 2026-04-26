@@ -33,7 +33,7 @@ use crate::chunk::{
     encode_delta_patch, encode_key, is_all_zero, pa_of, snapshot_of,
 };
 use crate::format::{read_and_verify_header, write_log_header};
-use crate::timing::{IndexMode, PageStore};
+use crate::btree::{IndexMode, PageStore};
 
 const SHADOW_SHARDS: usize = 2048;
 const SHADOW_SHARDS_MASK: u64 = (SHADOW_SHARDS as u64) - 1;
@@ -87,7 +87,7 @@ impl Shadow {
     }
 }
 
-pub struct FwDb {
+pub struct AppendOnlyDb {
     dir: PathBuf,
     delta_threshold: u16,
     use_shadow: bool,
@@ -128,7 +128,7 @@ impl RecordsPtr {
     }
 }
 
-impl FwDb {
+impl AppendOnlyDb {
     pub fn open(
         name: impl AsRef<Path>,
         worker_count: usize,

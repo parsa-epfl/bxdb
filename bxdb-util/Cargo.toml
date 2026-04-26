@@ -1,0 +1,15 @@
+[package]
+name = "bxdb-util"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "bxdb-convert"
+path = "src/bin/bxdb_convert.rs"
+
+[[bin]]
+name = "bxdb-purge"
+path = "src/bin/bxdb_purge.rs"
+
+[dependencies]
+bxdb = { package = "bxdb-core", path = "../bxdb-core" }

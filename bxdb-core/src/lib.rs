@@ -15,9 +15,9 @@ pub mod chunk;
 pub mod convert;
 pub mod format;
 pub mod purge;
-pub mod fw;
-pub mod timing;
+pub mod append_only;
+pub mod btree;
 
-pub use timing::{IndexMode, TimingDb};
-pub use fw::FwDb;
+pub use btree::{IndexMode, BtreeDb};
+pub use append_only::AppendOnlyDb;
 pub use chunk::{DEFAULT_DELTA_THRESHOLD, MAX_SNAPSHOT_ID, PAGE_SIZE, encode_key};

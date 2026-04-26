@@ -10,7 +10,7 @@ use bxdb::chunk::{
     MAGIC_LOG, pa_of, snapshot_of,
 };
 use bxdb::format::read_and_verify_header;
-use bxdb::timing::IndexMode;
+use bxdb::btree::IndexMode;
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::execute;
