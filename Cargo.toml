@@ -16,6 +16,10 @@ name = "bxdb-convert"
 path = "src/bin/bxdb_convert.rs"
 
 [[bin]]
+name = "bxdb-purge"
+path = "src/bin/bxdb_purge.rs"
+
+[[bin]]
 name = "bxdb-inspect"
 path = "src/bin/bxdb_inspect.rs"
 required-features = ["inspect"]

@@ -14,6 +14,7 @@ pub mod cache;
 pub mod chunk;
 pub mod convert;
 pub mod format;
+pub mod purge;
 pub mod fw;
 pub mod timing;
 

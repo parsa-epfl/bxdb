@@ -3,6 +3,7 @@ use std::process::Command;
 
 use bxdb::cache::{SharedCache, TOTAL_BYTES};
 use bxdb::chunk::PAGE_SIZE;
+use bxdb::purge;
 use bxdb::{FwDb, IndexMode, TimingDb};
 use rand::{Rng, SeedableRng};
 use rand::rngs::StdRng;
@@ -491,4 +492,170 @@ fn key_packing_limits() {
     let key = bxdb::encode_key(pa_max, snap_max);
     assert_eq!(key >> 19, pa_max);
     assert_eq!(key & ((1u64 << 19) - 1), snap_max as u64);
+}
+
+#[test]
+fn purge_deletes_high_snapshot_records_and_blobs() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("db");
+    let n_pages = 16u64;
+    let mut rng = StdRng::seed_from_u64(99);
+
+    // Write different pages at each snapshot so we can distinguish them.
+    let snap1_page0 = random_page(&mut rng);
+    let snap2_page0 = random_page(&mut rng);
+    let snap3_page0 = random_page(&mut rng);
+
+    // Snapshot 1: write our known page at PA 0, plus other pages.
+    {
+        let mut memory = make_memory(n_pages as usize);
+        let mut bitmap = vec![0u64; 1];
+        set_page(&mut memory, 0, &snap1_page0);
+        set_dirty(&mut bitmap, 0);
+        for i in 1..n_pages {
+            let p = random_page(&mut rng);
+            set_page(&mut memory, i as usize, &p);
+            set_dirty(&mut bitmap, i);
+        }
+        let mut fw = FwDb::open(&dir, 4, 0, false).unwrap();
+        fw.save_pages(&memory, &bitmap, n_pages, 1).unwrap();
+    }
+
+    // Snapshot 2: change page 0.
+    {
+        let mut memory = make_memory(n_pages as usize);
+        let mut bitmap = vec![0u64; 1];
+        set_page(&mut memory, 0, &snap2_page0);
+        set_dirty(&mut bitmap, 0);
+        let mut fw = FwDb::open(&dir, 4, 0, false).unwrap();
+        fw.save_pages(&memory, &bitmap, n_pages, 2).unwrap();
+    }
+
+    // Snapshot 3: change page 0 again.
+    {
+        let mut memory = make_memory(n_pages as usize);
+        let mut bitmap = vec![0u64; 1];
+        set_page(&mut memory, 0, &snap3_page0);
+        set_dirty(&mut bitmap, 0);
+        let mut fw = FwDb::open(&dir, 4, 0, false).unwrap();
+        fw.save_pages(&memory, &bitmap, n_pages, 3).unwrap();
+    }
+
+    convert_to_btree(&dir);
+
+    // Before purge: floor queries return the latest page at or below each snapshot.
+    let rdb = open_read(&dir);
+    assert_eq!(rdb.load_page(0, 1).unwrap().unwrap(), snap1_page0);
+    assert_eq!(rdb.load_page(0, 2).unwrap().unwrap(), snap2_page0);
+    assert_eq!(rdb.load_page(0, 3).unwrap().unwrap(), snap3_page0);
+    drop(rdb);
+
+    // Purge records with snapshot > 1.
+    let removed = purge::purge(&dir, 1).unwrap();
+    assert!(removed > 0);
+
+    // After purge: snap 2 and 3 records are gone.
+    // load_page uses floor: querying snap 2 or 3 falls back to snap 1.
+    let rdb = open_read(&dir);
+    assert_eq!(rdb.load_page(0, 1).unwrap().unwrap(), snap1_page0);
+    assert_eq!(rdb.load_page(0, 2).unwrap().unwrap(), snap1_page0);
+    assert_eq!(rdb.load_page(0, 3).unwrap().unwrap(), snap1_page0);
+
+    // Purge again with same threshold removes nothing.
+    assert_eq!(purge::purge(&dir, 1).unwrap(), 0);
+
+    // Purge everything.
+    let removed2 = purge::purge(&dir, 0).unwrap();
+    assert!(removed2 > 0);
+    let rdb = open_read(&dir);
+    assert!(rdb.load_page(0, 3).unwrap().is_none());
+}
+
+#[test]
+fn purge_deletes_high_snapshot_from_log_format() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("db");
+    let n_pages = 16u64;
+    let mut rng = StdRng::seed_from_u64(99);
+
+    let snap1_page0 = random_page(&mut rng);
+    let snap2_page0 = random_page(&mut rng);
+    let snap3_page0 = random_page(&mut rng);
+
+    // Snapshot 1.
+    {
+        let mut memory = make_memory(n_pages as usize);
+        let mut bitmap = vec![0u64; 1];
+        set_page(&mut memory, 0, &snap1_page0);
+        set_dirty(&mut bitmap, 0);
+        for i in 1..n_pages {
+            let p = random_page(&mut rng);
+            set_page(&mut memory, i as usize, &p);
+            set_dirty(&mut bitmap, i);
+        }
+        let mut fw = FwDb::open(&dir, 4, 0, false).unwrap();
+        fw.save_pages(&memory, &bitmap, n_pages, 1).unwrap();
+    }
+
+    // Snapshot 2.
+    {
+        let mut memory = make_memory(n_pages as usize);
+        let mut bitmap = vec![0u64; 1];
+        set_page(&mut memory, 0, &snap2_page0);
+        set_dirty(&mut bitmap, 0);
+        let mut fw = FwDb::open(&dir, 4, 0, false).unwrap();
+        fw.save_pages(&memory, &bitmap, n_pages, 2).unwrap();
+    }
+
+    // Snapshot 3.
+    {
+        let mut memory = make_memory(n_pages as usize);
+        let mut bitmap = vec![0u64; 1];
+        set_page(&mut memory, 0, &snap3_page0);
+        set_dirty(&mut bitmap, 0);
+        let mut fw = FwDb::open(&dir, 4, 0, false).unwrap();
+        fw.save_pages(&memory, &bitmap, n_pages, 3).unwrap();
+    }
+
+    // Purge directly from chunks.log (no prior conversion).
+    assert!(dir.join("chunks.log").exists());
+    assert!(!dir.join("index.bxdb").exists());
+    let removed = purge::purge(&dir, 1).unwrap();
+    assert!(removed > 0);
+
+    // After purge, index.bxdb exists and chunks.log is gone.
+    assert!(dir.join("index.bxdb").exists());
+    assert!(!dir.join("chunks.log").exists());
+
+    // Floor queries should fall back to snap 1.
+    let rdb = open_read(&dir);
+    assert_eq!(rdb.load_page(0, 1).unwrap().unwrap(), snap1_page0);
+    assert_eq!(rdb.load_page(0, 2).unwrap().unwrap(), snap1_page0);
+    assert_eq!(rdb.load_page(0, 3).unwrap().unwrap(), snap1_page0);
+}
+
+#[test]
+fn save_pages_rejects_non_monotonic_snapshots() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("db");
+    let n_pages = 16u64;
+
+    let mut fw = FwDb::open(&dir, 4, 0, false).unwrap();
+    let memory = make_memory(n_pages as usize);
+    let mut bitmap = vec![0u64; 1];
+    for i in 0..n_pages {
+        set_dirty(&mut bitmap, i);
+    }
+
+    // First save at snap 5 works.
+    fw.save_pages(&memory, &bitmap, n_pages, 5).unwrap();
+
+    // Same snapshot is rejected.
+    assert!(fw.save_pages(&memory, &bitmap, n_pages, 5).is_err());
+
+    // Lower snapshot is rejected.
+    assert!(fw.save_pages(&memory, &bitmap, n_pages, 4).is_err());
+
+    // Higher snapshot still works.
+    fw.save_pages(&memory, &bitmap, n_pages, 6).unwrap();
 }

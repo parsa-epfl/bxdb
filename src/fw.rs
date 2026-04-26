@@ -99,6 +99,8 @@ pub struct FwDb {
     records_buf: Vec<ChunkRecord>,
     // Exclusive prefix-sum of per-group dirty counts; len = num_groups + 1.
     offsets_buf: Vec<u32>,
+    // Tracks the last snapshot_id written; enforces monotonic growth.
+    last_snapshot: Option<u32>,
 }
 
 struct BlobFile {
@@ -193,6 +195,7 @@ impl FwDb {
             pool,
             records_buf: Vec::new(),
             offsets_buf: Vec::new(),
+            last_snapshot: None,
         })
     }
 
@@ -213,6 +216,17 @@ impl FwDb {
                 "snapshot_id exceeds 19-bit range",
             ));
         }
+        if let Some(last) = self.last_snapshot {
+            if snapshot_id <= last {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "snapshot_id must increase monotonically: got {snapshot_id} after {last}"
+                    ),
+                ));
+            }
+        }
+        self.last_snapshot = Some(snapshot_id);
         let expected_mem = (total_page_count as u128) * (PAGE_SIZE as u128);
         if memory.len() as u128 != expected_mem {
             return Err(io::Error::new(
