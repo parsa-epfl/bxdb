@@ -12,6 +12,10 @@ followed by an offline conversion step, after which a read-only phase begins.
 Reads and writes never overlap. Both the write and read interfaces are fully
 **synchronous** — every call blocks until the operation is complete and durable.
 
+A separate **purge** tool allows batch deletion of records and their associated
+blob data above a given snapshot threshold, freeing disk space without disrupting
+the remaining data.
+
 ---
 
 ## 2. Goals and Constraints
@@ -25,7 +29,8 @@ Reads and writes never overlap. Both the write and read interfaces are fully
 | Write latency | Fast; parallelised internally across workers |
 | Durability | `bxdb_save_pages` flushes to disk before returning |
 | Read latency | Tolerant; targeting milliseconds (compute < 10% of I/O time) |
-| Operations | Create and read only — no updates, no deletes |
+| Operations | Create, read, and offline batch delete via `bxdb-purge` |
+| Snapshot ordering | Snapshot IDs must increase monotonically across `save_pages` calls |
 | Interface | Compiled shared library with a synchronous C API |
 
 ### Combined Key Encoding
@@ -40,54 +45,65 @@ Reads and writes never overlap. Both the write and read interfaces are fully
 This packing means a single `u64` uniquely identifies any `(PA, snapshot_id)`
 pair within the supported ranges.
 
+The maximum snapshot ID stored in a database is persisted in the on-disk header
+(see §7), enabling tools like `bxdb-inspect` and `bxdb-purge` to inspect and act
+on the bounds of stored data.
+
 ---
 
 ## 3. C API
 
 ```c
 /* Initialise the library. Must be called once before any other function. */
-bxdb_t *bxdb_init(void);
+BxdbHandle *bxdb_init(void);
 
-/* Open a database in fw (functional-warming) mode. Supports bulk saves
- * and bulk loads of pages. worker_count sets parallelism for saves.
- * delta_threshold: max non-zero words in a patch before a Full chunk is
- * written instead (default: 256, i.e. half of a 4 KB page). */
-bxdb_t *bxdb_open_for_fw(const char *name, int worker_count,
-                          uint16_t delta_threshold);
+/* Open a database in append-only mode. Supports bulk saves and bulk loads
+ * of pages. worker_count sets parallelism for saves. delta_threshold: max
+ * non-zero words in a patch before a Full chunk is written instead
+ * (default: 256, i.e. half of a 4 KB page). */
+BxdbHandle *bxdb_open_for_append_only(const char *name, int worker_count,
+                                       uint16_t delta_threshold, bool use_shadow);
 
-/* Open a database in timing mode (after conversion has been run).
- * Supports single-page reads only. */
-bxdb_t *bxdb_open_for_timing(const char *name);
+/* Open a database in btree mode (after conversion has been run).
+ * Supports single-page reads. */
+BxdbHandle *bxdb_open_for_btree(const char *name);
+
+/* Close a previously-opened database handle. */
+void bxdb_close(BxdbHandle *db);
 
 /*
  * Save pages for a snapshot. Synchronous — blocks until all dirty pages
  * have been compressed, written to disk, and fsynced.
+ *
+ * snapshot_id must be strictly greater than the previous call's value
+ * on the same handle. The on-disk header is updated with the new maximum
+ * after each successful call.
  *
  * memory           - contiguous array of total_page_count × 4096 bytes
  * dirty_bitmap     - one bit per page; only pages with bit=1 are processed
  * total_page_count - number of pages in memory[]
  * snapshot_id      - must fit in 19 bits
  */
-void bxdb_save_pages(bxdb_t         *db,
-                     const char     *memory,
-                     const uint64_t *dirty_bitmap,
-                     uint64_t        total_page_count,
-                     uint32_t        snapshot_id);
+void bxdb_save_pages(BxdbHandle      *db,
+                     const char      *memory,
+                     const uint64_t  *dirty_bitmap,
+                     uint64_t         total_page_count,
+                     uint32_t         snapshot_id);
 
 /*
- * Load a single page. Synchronous. Requires a timing-mode handle.
+ * Load a single page. Synchronous. Requires a btree-mode handle.
  *
  * Fills page[0..4095] with the content of PA at the largest stored
  * snapshot_id' ≤ snapshot_id. Returns false if no such page exists.
  */
-bool bxdb_load_page(bxdb_t   *db,
-                    char     *page,
-                    uint64_t  pa,
-                    uint32_t  snapshot_id);
+bool bxdb_load_page(BxdbHandle    *db,
+                    char          *page,
+                    uint64_t       pa,
+                    uint32_t       snapshot_id);
 
 /*
  * Load all pages for a snapshot into a contiguous buffer. Synchronous.
- * Requires an fw-mode handle.
+ * Requires an append-only-mode handle.
  *
  * pages            - output buffer of total_page_count × 4096 bytes
  * pa_offset        - PA of the first page (pages[0] = PA pa_offset,
@@ -99,16 +115,13 @@ bool bxdb_load_page(bxdb_t   *db,
  * Returns false if any page could not be resolved. Pages that have no
  * stored version are zero-filled.
  */
-bool bxdb_load_all_pages(bxdb_t   *db,
-                         char     *pages,
-                         uint64_t  pa_offset,
-                         uint64_t  total_page_count,
-                         uint32_t  snapshot_id,
-                         int       worker_count);
+bool bxdb_load_all_pages(BxdbHandle    *db,
+                         char          *pages,
+                         uint64_t       pa_offset,
+                         uint64_t       total_page_count,
+                         uint32_t       snapshot_id,
+                         int            worker_count);
 ```
-
-A separate binary `bxdb-convert` converts the write-phase output into the
-B-tree read index (see §7).
 
 ---
 
@@ -172,6 +185,20 @@ content. If zero, a `Zero` chunk is recorded with no blob data.
 and dirty bitmap, and the function returns only after all dirty pages are
 durable on disk.
 
+**Monotonic snapshot constraint.** Each `save_pages` call on a handle must use a
+snapshot ID strictly greater than the previous call's value. The library enforces
+this and returns an error on violations. This guarantee means:
+
+- Records in `chunks.log` appear in increasing snapshot order (within each
+  `save_pages` batch, every record shares the same snapshot ID; batches
+  themselves are sequential).
+- Blob data within each worker file is laid out in monotonically increasing
+  snapshot order — blobs for snapshot N are always at offsets lower than blobs
+  for snapshot N+1 within the same worker file.
+
+Both properties are exploited by `bxdb-purge` for efficient truncation-based
+deletion (see §8).
+
 ### Internal Parallelism
 
 Worker threads exist solely to **process dirty pages in parallel** within a
@@ -194,6 +221,11 @@ main thread:
 
 This approach requires no knowledge of how many dirty pages exist before
 scanning begins, and load-balances naturally across workers.
+
+After all I/O is complete and durable, the function seeks back to byte 9 in
+`chunks.log` and writes the current `snapshot_id` into the 4-byte
+`max_snapshot_id` header field, then seeks back to end-of-file so that the next
+call appends correctly.
 
 ### Per-Worker Processing
 
@@ -261,14 +293,31 @@ external metadata.
 | `chunks.log` (append-only) | `42 58 44 42 4C 4F 47 00` | `BXDBLOG\0` |
 | `index.bxdb` (B-tree) | `42 58 44 42 49 44 58 00` | `BXDBIDX\0` |
 
-Both files additionally store a 1-byte format version immediately after the
-magic (currently `0x01`), allowing future format changes to be detected.
+### File Header (16 bytes)
+
+Both file types share the same 16-byte header layout:
+
+```
+┌──────────────────────────────────────┐
+│ magic        (8 bytes)               │  BXDBLOG\0 or BXDBIDX\0
+├──────────────────────────────────────┤
+│ version      (1 byte)                │  currently 0x01
+├──────────────────────────────────────┤
+│ max_snap_id  (4 bytes, u32 LE)       │  highest snapshot_id in the file
+├──────────────────────────────────────┤
+│ reserved     (3 bytes)               │  zero-filled
+└──────────────────────────────────────┘
+```
+
+`max_snapshot_id` is the highest snapshot ID among all records in the file.
+For `chunks.log`, it is updated in-place after each successful `save_pages`
+call. For `index.bxdb`, it is set during conversion or purge.
 
 ### Append-Only Format (`chunks.log`)
 
 ```
 <name>/
-├── chunks.log          ← magic header + append-only ChunkRecord sequence
+├── chunks.log          ← header + append-only ChunkRecord sequence
 └── blobs/
     ├── worker_0.blob
     ├── worker_1.blob
@@ -279,9 +328,7 @@ File layout:
 
 ```
 ┌─────────────────────────────────┐
-│ magic (8 bytes): BXDBLOG\0      │
-│ version (1 byte): 0x01          │
-│ reserved (7 bytes): 0x00...     │
+│ header  (16 bytes)              │
 ├─────────────────────────────────┤
 │ ChunkRecord[]  (variable)       │
 └─────────────────────────────────┘
@@ -302,18 +349,22 @@ For `Zero` chunks, `offset` and `len` are zero.
 
 ### B-Tree Index Format (`index.bxdb`)
 
-Produced by `bxdb-convert`. Contains the same `ChunkRecord` entries sorted by
-key and stored in a B-tree for O(log N) floor queries.
+Produced by `bxdb-convert` or `bxdb-purge`. Fixed-size 32-byte records sorted
+by key for O(log N) floor queries via binary search over an mmap'd region.
 
 ```
 <name>/
-├── chunks.log      ← unchanged (append-only, kept as source of truth)
-├── index.bxdb      ← magic header + B-tree of ChunkRecord entries
-└── blobs/          ← unchanged
+├── index.bxdb      ← header + fixed-size record array, sorted by key
+└── blobs/          ← referenced by (worker_id, offset, len)
 ```
 
-Blob files are never rewritten. Both formats reference them by
-`(worker_id, offset, len)`.
+Each record is stored in a 32-byte fixed-width layout:
+
+```
+┌──────────┬─────────────┬───────────┬─────────┬────────┬─────────────┬──────────┐
+│ key (u64)│base_key (u64)│offset (u64)│len (u32)│type(u8)│worker_id(u8)│ pad (u16)│
+└──────────┴─────────────┴───────────┴─────────┴────────┴─────────────┴──────────┘
+```
 
 ### Format Detection
 
@@ -326,40 +377,89 @@ file is present:
 
 ---
 
-## 8. Conversion Tools
+## 8. Utility Tools
 
-Two conversion directions are supported, both provided by the `bxdb-convert`
-binary.
+### `bxdb-convert`
 
-### Append-Only → B-Tree
+Two conversion directions are supported.
+
+#### Append-Only → B-Tree
 
 ```
 bxdb-convert to-btree <name>
 ```
 
-1. Open `chunks.log`, verify magic `BXDBLOG\0`.
+1. Open `chunks.log`, read and verify header.
 2. Read all `ChunkRecord` entries.
-3. Sort by combined key ascending.
-4. Write `index.bxdb`: magic header `BXDBIDX\0` + version, then bulk-insert
-   records in sorted order (maximises B-tree fill ratio).
+3. Compute the maximum snapshot ID from all records.
+4. Sort by combined key ascending, deduplicate by key.
+5. Write `index.bxdb`: header (including the computed `max_snapshot_id`),
+   then records in sorted order.
 
 After this step, `load_all_pages` uses the B-tree path automatically.
 
-### B-Tree → Append-Only
+#### B-Tree → Append-Only
 
 ```
 bxdb-convert to-log <name>
 ```
 
-1. Open `index.bxdb`, verify magic `BXDBIDX\0`.
-2. Iterate all entries in key order.
-3. Write a new `chunks.log`: magic header `BXDBLOG\0` + version, then emit
-   records in iteration order.
+1. Open `index.bxdb`, read and verify header.
+2. Iterate all entries.
+3. Compute the maximum snapshot ID from all records.
+4. Group records by `snapshot_id` into a `BTreeMap<u32, Vec<ChunkRecord>>`;
+   sort each group by PA.
+5. Write a new `chunks.log`: header (including the computed `max_snapshot_id`),
+   then emit records in ascending snapshot order, PA order within each snapshot.
 
-Useful for exporting a database to a format that can be streamed or appended to,
-or for moving a database to a machine where the B-tree index was not transferred.
+This preserves the monotonic snapshot invariant in the output log — records for
+snapshot N appear before records for snapshot N+1, matching the order produced by
+`save_pages`.
 
-Both conversions are idempotent. Blob files are never touched by either.
+Both conversions are idempotent.
+
+### `bxdb-purge`
+
+```
+bxdb-purge <snapshot-threshold> <name>
+```
+
+Batch-deletes all records whose `snapshot_id` is strictly greater than the given
+threshold, along with the corresponding blob data.
+
+The tool accepts both `index.bxdb` and `chunks.log` as input, and **preserves
+the source format** in the output. It is idempotent: running it again with the
+same threshold removes nothing further.
+
+```
+bxdb-purge 100 /path/to/db
+```
+
+The process:
+
+1. Open and verify the header to obtain the stored `max_snapshot_id`.
+2. Read all records (from `index.bxdb` via fixed-size read, or from
+   `chunks.log` via variable-length scan).
+3. Retain only records where `snapshot_of(key) ≤ threshold`.
+4. **Truncate blob files.** Because blob data within each worker file is laid
+   out in monotonically increasing snapshot order (see §6), all blobs for
+   snapshots ≤ threshold form a contiguous prefix of each worker file. The
+   tool simply calls `ftruncate` at the highest offset still referenced by a
+   kept record, avoiding any data copy.
+5. Write the output file (same format as input) with an updated header
+   containing the new `max_snapshot_id`.
+6. Remove blob files that are no longer referenced by any record.
+
+### `bxdb-inspect`
+
+```
+bxdb-inspect <name>
+```
+
+Interactive TUI that displays database statistics including record counts per
+chunk type (Full/Delta/Zero), total blob bytes, and the `max_snapshot_id` from
+the file header. Supports browsing individual records and decompressing blob data
+on demand.
 
 ---
 
@@ -400,7 +500,7 @@ are cheap enough that caching their output is unnecessary.
 `bxdb_load_all_pages` dispatches work differently depending on the format
 detected at open time.
 
-**B-tree mode** (after conversion):
+**B-tree mode** (after conversion or purge):
 
 The main thread enqueues `total_page_count` floor-query jobs
 `(pa_offset + i, snapshot_id, output_slot = i)`. `worker_count` worker threads
@@ -480,9 +580,9 @@ Cache keys are the 64-bit combined keys of **Full chunks only**. `Delta` and
 
 | File | Written by | Read by | Notes |
 |---|---|---|---|
-| `chunks.log` | write workers, `bxdb-convert to-log` | `bxdb-convert to-btree`, readers | magic `BXDBLOG\0`; append-only |
-| `blobs/worker_N.blob` | worker N | readers | append-only, never rewritten |
-| `index.bxdb` | `bxdb-convert to-btree` | readers | magic `BXDBIDX\0`; B-tree, written once |
+| `chunks.log` | write workers, `bxdb-convert to-log`, `bxdb-purge` | `bxdb-convert to-btree`, readers | magic `BXDBLOG\0`; append-only; header updated in-place with max snapshot |
+| `blobs/worker_N.blob` | worker N | readers | append-only; truncated by `bxdb-purge` (never rewritten) |
+| `index.bxdb` | `bxdb-convert to-btree`, `bxdb-purge` | readers | magic `BXDBIDX\0`; fixed-size records, sorted by key |
 | shared memory region | first reader process | all reader processes | transient cache |
 
 ---
@@ -492,6 +592,7 @@ Cache keys are the 64-bit combined keys of **Full chunks only**. `Delta` and
 | Decision | Rationale |
 |---|---|
 | Synchronous API | Simpler caller contract; write phase is already separate from read phase so blocking is acceptable |
+| Monotonic snapshot enforcement | Simplifies purge: blob data is in snapshot order, so truncation suffices; also prevents accidental snapshot-id reuse |
 | Bitmap scan + work queue dispatch | Workers process pages as they are discovered; no need to pre-count dirty pages or pre-partition ranges |
 | Per-worker blob files | Eliminates file write contention; each worker appends independently |
 | fsync before returning from save | Guarantees durability; crash after return leaves a consistent state |
@@ -500,7 +601,11 @@ Cache keys are the 64-bit combined keys of **Full chunks only**. `Delta` and
 | zstd only for Full chunks | Delta patches are sparse `(u16, u64)` pairs; zstd on them adds decompression cost for negligible gain |
 | Magic numbers in file headers | Format is self-identifying; `load_all_pages` detects append-only vs B-tree without external metadata |
 | `load_all_pages` sequential scan on append-only | A single linear pass over `chunks.log` is more efficient than N floor queries for bulk loads |
-| Two-way conversion (`to-btree` / `to-log`) | B-tree → append-only allows streaming/export and recovery if only blobs + index survive |
+| Two-way conversion (`to-btree` / `to-log`) | B-tree → append-only uses `BTreeMap` grouping by snapshot_id so the output preserves monotonic snap order; allows streaming/export and recovery |
+| Blob truncation for purge (not rewrite) | Since blobs are in snap-order, a simple `ftruncate` at the highest kept offset removes all trailing data without copying |
+| Format-preserving purge | If the input is a log, the output is a log; if the input is an index, the output is an index — no surprise format changes |
+| `max_snapshot_id` in header | Enables `bxdb-inspect` to show the data range and `bxdb-purge` to know the highest snapshot present |
+| Separate `bxdb-purge` binary | Offline batch deletion; avoids complicating the write library with incremental delete logic |
 | Separate `bxdb-convert` binary | Write library stays simple; conversion can run offline or on a different machine |
 | Shared-memory cache | Avoids redundant decompression when multiple reader processes run on the same host |
 | 45+19 = 64-bit key packing | Single integer fits directly into B-tree, cache, and `HashMap` without extra indirection |
