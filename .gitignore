@@ -6,3 +6,5 @@ read-all
 *.csv
 *.raw
 stress-*
+save-bench-1w*
+test-save-full

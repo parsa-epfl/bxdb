@@ -4,6 +4,7 @@ use std::path::Path;
 
 use crate::chunk::{
     ChunkRecord, FIXED_RECORD_SIZE, HEADER_SIZE, LOG_RECORD_BASE_SIZE, MAGIC_IDX, MAGIC_LOG,
+    snapshot_of,
 };
 use crate::format::{read_and_verify_header, write_index_header, write_log_header};
 
@@ -25,6 +26,8 @@ pub fn to_btree(dir: &Path) -> io::Result<()> {
     records.sort_by_key(|r| r.key);
     records.dedup_by_key(|r| r.key);
 
+    let max_snap = records.iter().map(|r| snapshot_of(r.key)).max().unwrap_or(0);
+
     let tmp = idx_path.with_extension("bxdb.tmp");
     {
         let f = OpenOptions::new()
@@ -33,7 +36,7 @@ pub fn to_btree(dir: &Path) -> io::Result<()> {
             .truncate(true)
             .open(&tmp)?;
         let mut w = BufWriter::new(f);
-        write_index_header(&mut w)?;
+        write_index_header(&mut w, max_snap)?;
         let mut buf = [0u8; FIXED_RECORD_SIZE];
         for rec in &records {
             rec.encode_fixed(&mut buf);
@@ -67,6 +70,8 @@ pub fn to_log(dir: &Path) -> io::Result<()> {
         }
     }
 
+    let max_snap = records.iter().map(|r| snapshot_of(r.key)).max().unwrap_or(0);
+
     let tmp = log_path.with_extension("log.tmp");
     {
         let f = OpenOptions::new()
@@ -75,7 +80,7 @@ pub fn to_log(dir: &Path) -> io::Result<()> {
             .truncate(true)
             .open(&tmp)?;
         let mut w = BufWriter::new(f);
-        write_log_header(&mut w)?;
+        write_log_header(&mut w, max_snap)?;
         for rec in &records {
             rec.write_to(&mut w)?;
         }

@@ -1,29 +1,32 @@
-use std::collections::{BTreeMap, HashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufReader, Read, Write};
-use std::os::unix::fs::FileExt;
+use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
 use crate::chunk::{
-    ChunkKind, ChunkRecord, FIXED_RECORD_SIZE, HEADER_SIZE, MAGIC_IDX, MAGIC_LOG,
-    snapshot_of,
+    ChunkKind, ChunkRecord, FIXED_RECORD_SIZE, HEADER_SIZE, MAGIC_IDX, MAGIC_LOG, snapshot_of,
 };
-use crate::format::{read_and_verify_header, write_index_header};
+use crate::format::{read_and_verify_header, write_index_header, write_log_header};
 
 /// Purge all records and their blobs whose snapshot_id is strictly greater
 /// than `snapshot_threshold`.
 ///
 /// Accepts both B-tree (`index.bxdb`) and append-only log (`chunks.log`)
-/// formats as input. Always writes `index.bxdb` as output (the canonical read
-/// format). If only `chunks.log` exists, the log is converted to B-tree in the
-/// process and the log is removed.
+/// formats as input, and preserves the source format in the output.
+///
+/// Because snapshot ids grow monotonically, blob data within each worker file
+/// is laid out in snapshot order. This function exploits that property by
+/// truncating worker blob files at the highest offset still referenced by a
+/// kept record, avoiding a full blob rewrite.
 ///
 /// Returns the number of records removed.
 pub fn purge(dir: &Path, snapshot_threshold: u32) -> io::Result<usize> {
     let idx_path = dir.join("index.bxdb");
     let log_path = dir.join("chunks.log");
 
-    let mut records = if idx_path.exists() {
+    let from_log = !idx_path.exists() && log_path.exists();
+
+    let mut records = if !from_log && idx_path.exists() {
         read_index(&idx_path)?
     } else if log_path.exists() {
         read_log(&log_path)?
@@ -42,14 +45,19 @@ pub fn purge(dir: &Path, snapshot_threshold: u32) -> io::Result<usize> {
         return Ok(0);
     }
 
-    compact_blobs(dir, &mut records)?;
-    write_index_file(dir, &records)?;
+    let max_snap = records
+        .iter()
+        .map(|r| snapshot_of(r.key))
+        .max()
+        .unwrap_or(0);
+
+    truncate_blobs(dir, &records)?;
     cleanup_unused_blob_files(dir, &records)?;
 
-    // Remove chunks.log now that index.bxdb is canonical.
-    let log_path = dir.join("chunks.log");
-    if log_path.exists() {
-        fs::remove_file(&log_path)?;
+    if from_log {
+        write_log_file(dir, &records, max_snap)?;
+    } else {
+        write_index_file(dir, &records, max_snap)?;
     }
 
     Ok(removed)
@@ -84,76 +92,72 @@ fn read_log(log_path: &Path) -> io::Result<Vec<ChunkRecord>> {
     let mut r = BufReader::new(file);
     read_and_verify_header(&mut r, &MAGIC_LOG)?;
 
-    let capacity = (meta.len().saturating_sub(HEADER_SIZE as u64)
-        / size_of::<u64>() as u64) as usize;
+    let capacity =
+        (meta.len().saturating_sub(HEADER_SIZE as u64) / size_of::<u64>() as u64) as usize;
     let mut records: Vec<ChunkRecord> = Vec::with_capacity(capacity.min(1 << 24));
     while let Some(rec) = ChunkRecord::read_from(&mut r)? {
         records.push(rec);
     }
 
-    // Log records may be unsorted and contain duplicates for the same key
-    // across multiple save_pages calls. Sort by key and deduplicate so the
-    // output index has exactly one record per key. Stable sort preserves
-    // temporal order for same-key records: the first occurrence (lowest
-    // snapshot_id) survives dedup.
     records.sort_by_key(|r| r.key);
     records.dedup_by_key(|r| r.key);
 
     Ok(records)
 }
 
-fn compact_blobs(dir: &Path, records: &mut [ChunkRecord]) -> io::Result<()> {
-    // Group non-zero records by worker_id, keyed by old offset.
-    // BTreeMap sorts by offset so we write blobs sequentially in the new file.
-    let mut by_worker: BTreeMap<u8, BTreeMap<u64, Vec<usize>>> = BTreeMap::new();
+/// Truncate each worker blob file so that only blobs referenced by kept
+/// records remain.  Because save_pages calls append blobs in monotonically
+/// increasing snapshot order, the kept blobs (snap <= threshold) are a
+/// prefix of each worker file and the deleted blobs (snap > threshold) a
+/// suffix.
+fn truncate_blobs(dir: &Path, records: &[ChunkRecord]) -> io::Result<()> {
+    let mut worker_max_end: FxHashMap<u8, u64> = FxHashMap::default();
 
-    for (i, rec) in records.iter().enumerate() {
+    for rec in records {
         if rec.kind == ChunkKind::Zero {
             continue;
         }
-        by_worker
+        let end = rec.offset + rec.len as u64;
+        worker_max_end
             .entry(rec.worker_id)
-            .or_default()
-            .entry(rec.offset)
-            .or_default()
-            .push(i);
+            .and_modify(|e| *e = (*e).max(end))
+            .or_insert(end);
     }
 
     let blobs_dir = dir.join("blobs");
-
-    for (&worker_id, offset_map) in &by_worker {
-        let old_path = blobs_dir.join(format!("worker_{worker_id}.blob"));
-        let old = File::open(&old_path)?;
-        let tmp_path = blobs_dir.join(format!(".worker_{worker_id}.blob.tmp"));
-        let new_path = blobs_dir.join(format!("worker_{worker_id}.blob"));
-
-        let mut w = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&tmp_path)?;
-        let mut new_offset: u64 = 0;
-
-        for (&old_offset, indices) in offset_map {
-            let first_idx = indices[0];
-            let blob_len = records[first_idx].len as usize;
-            let mut blob = vec![0u8; blob_len];
-            old.read_exact_at(&mut blob, old_offset)?;
-            w.write_all(&blob)?;
-            for &idx in indices {
-                records[idx].offset = new_offset;
-            }
-            new_offset += blob_len as u64;
-        }
-
-        w.sync_all()?;
-        std::fs::rename(&tmp_path, &new_path)?;
+    for (worker_id, keep_len) in worker_max_end {
+        let path = blobs_dir.join(format!("worker_{worker_id}.blob"));
+        let f = OpenOptions::new().write(true).open(&path)?;
+        f.set_len(keep_len)?;
     }
 
     Ok(())
 }
 
-fn write_index_file(dir: &Path, records: &[ChunkRecord]) -> io::Result<()> {
+fn write_log_file(dir: &Path, records: &[ChunkRecord], max_snap: u32) -> io::Result<()> {
+    let log_path = dir.join("chunks.log");
+    let tmp_path = log_path.with_extension("log.tmp");
+
+    {
+        let f = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp_path)?;
+        let mut w = BufWriter::new(f);
+        write_log_header(&mut w, max_snap)?;
+        for rec in records {
+            rec.write_to(&mut w)?;
+        }
+        w.flush()?;
+        w.get_ref().sync_all()?;
+    }
+
+    std::fs::rename(&tmp_path, &log_path)?;
+    Ok(())
+}
+
+fn write_index_file(dir: &Path, records: &[ChunkRecord], max_snap: u32) -> io::Result<()> {
     let idx_path = dir.join("index.bxdb");
     let tmp_path = idx_path.with_extension("bxdb.tmp");
 
@@ -163,8 +167,8 @@ fn write_index_file(dir: &Path, records: &[ChunkRecord]) -> io::Result<()> {
             .write(true)
             .truncate(true)
             .open(&tmp_path)?;
-        let mut w = std::io::BufWriter::new(f);
-        write_index_header(&mut w)?;
+        let mut w = BufWriter::new(f);
+        write_index_header(&mut w, max_snap)?;
         let mut buf = [0u8; FIXED_RECORD_SIZE];
         for rec in records {
             rec.encode_fixed(&mut buf);
@@ -179,7 +183,7 @@ fn write_index_file(dir: &Path, records: &[ChunkRecord]) -> io::Result<()> {
 }
 
 fn cleanup_unused_blob_files(dir: &Path, records: &[ChunkRecord]) -> io::Result<()> {
-    let used: HashSet<u8> = records.iter().map(|r| r.worker_id).collect();
+    let used: FxHashSet<u8> = records.iter().map(|r| r.worker_id).collect();
     let blobs_dir = dir.join("blobs");
     if !blobs_dir.exists() {
         return Ok(());

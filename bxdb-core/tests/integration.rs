@@ -629,9 +629,9 @@ fn purge_deletes_high_snapshot_from_log_format() {
     let removed = purge::purge(&dir, 1).unwrap();
     assert!(removed > 0);
 
-    // After purge, index.bxdb exists and chunks.log is gone.
-    assert!(dir.join("index.bxdb").exists());
-    assert!(!dir.join("chunks.log").exists());
+    // After purge, chunks.log is preserved (not converted to index.bxdb).
+    assert!(dir.join("chunks.log").exists());
+    assert!(!dir.join("index.bxdb").exists());
 
     // Floor queries should fall back to snap 1.
     let rdb = open_read(&dir);

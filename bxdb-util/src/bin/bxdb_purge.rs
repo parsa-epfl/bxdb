@@ -33,5 +33,5 @@ fn usage(prog: &str) {
     eprintln!("usage: {prog} <snapshot-threshold> <dir>");
     eprintln!();
     eprintln!("  snapshot-threshold  Delete records with snapshot_id > this value");
-    eprintln!("  dir                 Database directory (must contain index.bxdb)");
+    eprintln!("  dir                 Database directory (must contain index.bxdb or chunks.log)");
 }

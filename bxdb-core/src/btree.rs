@@ -374,7 +374,8 @@ fn verify_index_header(mmap: &Mmap) -> io::Result<()> {
 fn verify_log_header(path: &Path) -> io::Result<()> {
     let file = File::open(path)?;
     let mut r = BufReader::new(file);
-    read_and_verify_header(&mut r, &MAGIC_LOG)
+    read_and_verify_header(&mut r, &MAGIC_LOG)?;
+    Ok(())
 }
 
 fn build_lazy_index(path: &Path) -> io::Result<LazyIndex> {

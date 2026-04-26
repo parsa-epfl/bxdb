@@ -158,7 +158,7 @@ impl AppendOnlyDb {
             .open(&log_path)?;
         let size = log_file.metadata()?.len();
         if size == 0 {
-            write_log_header(&mut log_file)?;
+            write_log_header(&mut log_file, 0)?;
         } else {
             log_file.seek(SeekFrom::Start(0))?;
             read_and_verify_header(&mut log_file, &MAGIC_LOG)?;
@@ -410,6 +410,13 @@ impl AppendOnlyDb {
             let wall_s = t_blob_sync.elapsed().as_secs_f64();
             let cpu_s = (process_cpu_ns() - cpu_ns_before) as f64 / 1e9;
             eprintln!("[TIMING] all_blob_syncs total: {wall_s:.3}s  cpu: {cpu_s:.3}s  ({:.1}% CPU)", cpu_s / wall_s * 100.0);
+        }
+        // Update max_snapshot_id in the on-disk header.
+        {
+            let mut log = self.log_file.lock();
+            log.seek(SeekFrom::Start(9))?;
+            log.write_all(&snapshot_id.to_le_bytes())?;
+            log.seek(SeekFrom::End(0))?;
         }
         Ok(())
     }
