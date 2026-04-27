@@ -1,6 +1,6 @@
 use rustc_hash::FxHashMap;
 use std::fs::File;
-use std::io::{self, BufReader, Read};
+use std::io::{self, BufReader, Read, Seek};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -28,11 +28,29 @@ use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() != 2 {
-        eprintln!("usage: {} <db-dir>", args[0]);
-        return ExitCode::from(2);
+    let mut cli_snapshot: Option<u32> = None;
+    let mut db_arg: Option<&str> = None;
+    let mut i = 1;
+    while i < args.len() {
+        if args[i] == "--snapshot" && i + 1 < args.len() {
+            match args[i + 1].parse() {
+                Ok(s) => cli_snapshot = Some(s),
+                Err(_) => {
+                    eprintln!("bxdb-inspect: invalid snapshot id: {}", args[i + 1]);
+                    return ExitCode::from(2);
+                }
+            }
+            i += 2;
+        } else {
+            db_arg = Some(&args[i]);
+            i += 1;
+        }
     }
-    let dir = PathBuf::from(&args[1]);
+    let Some(db_arg) = db_arg else {
+        eprintln!("usage: {} [--snapshot N] <db-dir>", args[0]);
+        return ExitCode::from(2);
+    };
+    let dir = PathBuf::from(db_arg);
     let (mode, records, max_snap) = match load_records(&dir) {
         Ok(x) => x,
         Err(e) => {
@@ -41,7 +59,10 @@ fn main() -> ExitCode {
         }
     };
     let stats = Stats::from_records(&records);
-    let app = App::new(dir, mode, records, stats, max_snap);
+    let mut app = App::new(dir, mode, records, stats, max_snap);
+    if let Some(snap) = cli_snapshot {
+        app.apply_filter(snap);
+    }
     if let Err(e) = run(app) {
         eprintln!("bxdb-inspect: {e}");
         return ExitCode::FAILURE;
@@ -63,26 +84,49 @@ fn load_records(dir: &Path) -> io::Result<(IndexMode, Vec<ChunkRecord>, u32)> {
             / FIXED_RECORD_SIZE as u64) as usize;
         let mut records = Vec::with_capacity(capacity);
         let mut buf = [0u8; FIXED_RECORD_SIZE];
+        let mut last_pct = 0u8;
         loop {
             match r.read_exact(&mut buf) {
                 Ok(()) => records.push(ChunkRecord::decode_fixed(&buf)?),
                 Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
                 Err(e) => return Err(e),
             }
+            let pct = (records.len() as f64 * 100.0 / capacity as f64) as u8;
+            if pct != last_pct && pct < 100 {
+                last_pct = pct;
+                if pct % 5 == 0 {
+                    eprint!("\r  Load index.bxdb [{:>3}%] {} / {} records",
+                        pct, records.len(), capacity);
+                }
+            }
         }
+        eprintln!("\r  Load index.bxdb [100%] {} records", records.len());
         Ok((IndexMode::BTree, records, max_snap))
     } else if log_path.exists() {
         let f = File::open(&log_path)?;
         let meta = f.metadata()?;
+        let total_bytes = meta.len();
         let mut r = BufReader::new(f);
         let max_snap = read_and_verify_header(&mut r, &MAGIC_LOG)?;
-        let capacity = (meta.len().saturating_sub(HEADER_SIZE as u64)
+        let capacity = (total_bytes.saturating_sub(HEADER_SIZE as u64)
             / LOG_RECORD_BASE_SIZE as u64) as usize;
         let mut records = Vec::with_capacity(capacity);
+        let mut last_pct = 0u8;
         while let Some(rec) = ChunkRecord::read_from(&mut r)? {
             records.push(rec);
+            let pos = r.stream_position()?;
+            let pct = ((pos as f64 * 100.0 / total_bytes as f64) as u8).min(100);
+            if pct != last_pct && pct < 100 {
+                last_pct = pct;
+                if pct % 5 == 0 {
+                    eprint!("\r  Load chunks.log [{:>3}%] {} records",
+                        pct, records.len());
+                }
+            }
         }
+        eprintln!("\r  Load chunks.log [100%] {} records (sorting...)", records.len());
         records.sort_by_key(|r| r.key);
+        eprintln!("  Sorted {} records.", records.len());
         Ok((IndexMode::AppendOnly, records, max_snap))
     } else {
         Err(io::Error::new(
@@ -164,12 +208,16 @@ struct App {
     dir: PathBuf,
     mode: IndexMode,
     records: Vec<ChunkRecord>,
+    record_labels: Vec<String>,
     stats: Stats,
     max_snapshot: u32,
     list_state: ListState,
     blob_files: FxHashMap<u8, File>,
     detail_scroll: u16,
     detail: Option<(usize, Detail)>,
+    filter_snapshot: Option<u32>,
+    filtered_indices: Option<Vec<usize>>,
+    filter_input: Option<String>,
 }
 
 enum Detail {
@@ -185,16 +233,28 @@ impl App {
         if !records.is_empty() {
             list_state.select(Some(0));
         }
+        let record_labels = records
+            .iter()
+            .map(|r| {
+                let pa = pa_of(r.key);
+                let snap = snapshot_of(r.key);
+                format!("PA=0x{pa:011x}  S={snap:>5}")
+            })
+            .collect();
         Self {
             dir,
             mode,
             records,
+            record_labels,
             stats,
             max_snapshot,
             list_state,
             blob_files: FxHashMap::default(),
             detail_scroll: 0,
             detail: None,
+            filter_snapshot: None,
+            filtered_indices: None,
+            filter_input: None,
         }
     }
 
@@ -203,21 +263,22 @@ impl App {
     }
 
     fn move_by(&mut self, delta: isize) {
-        if self.records.is_empty() {
+        if self.active_count() == 0 {
             return;
         }
         let cur = self.list_state.selected().unwrap_or(0) as isize;
-        let last = self.records.len() as isize - 1;
+        let last = self.active_count() as isize - 1;
         let next = (cur + delta).clamp(0, last) as usize;
         self.list_state.select(Some(next));
         self.detail_scroll = 0;
     }
 
     fn go_to(&mut self, i: usize) {
-        if self.records.is_empty() {
+        let total = self.active_count();
+        if total == 0 {
             return;
         }
-        let clamped = i.min(self.records.len() - 1);
+        let clamped = i.min(total - 1);
         self.list_state.select(Some(clamped));
         self.detail_scroll = 0;
     }
@@ -229,7 +290,7 @@ impl App {
         if self.detail.as_ref().map(|(idx, _)| *idx) == Some(i) {
             return;
         }
-        let rec = self.records[i];
+        let rec = *self.record_at(i);
         let d = match rec.kind {
             ChunkKind::Zero => Detail::Zero,
             ChunkKind::Full => match self.read_blob(rec.worker_id, rec.offset, rec.len) {
@@ -262,6 +323,51 @@ impl App {
         let mut buf = vec![0u8; len as usize];
         f.read_exact_at(&mut buf, offset)?;
         Ok(buf)
+    }
+
+    fn active_count(&self) -> usize {
+        match &self.filtered_indices {
+            Some(f) => f.len(),
+            None => self.records.len(),
+        }
+    }
+
+    fn real_idx(&self, active_idx: usize) -> usize {
+        match &self.filtered_indices {
+            Some(f) => f[active_idx],
+            None => active_idx,
+        }
+    }
+
+    fn record_at(&self, active_idx: usize) -> &ChunkRecord {
+        &self.records[self.real_idx(active_idx)]
+    }
+
+    fn label_at(&self, active_idx: usize) -> &str {
+        &self.record_labels[self.real_idx(active_idx)]
+    }
+
+    fn apply_filter(&mut self, snap: u32) {
+        let indices: Vec<usize> = self
+            .records
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| snapshot_of(r.key) == snap)
+            .map(|(i, _)| i)
+            .collect();
+        self.filtered_indices = Some(indices);
+        self.filter_snapshot = Some(snap);
+        self.detail = None;
+        self.list_state.select(if self.active_count() > 0 { Some(0) } else { None });
+        self.detail_scroll = 0;
+    }
+
+    fn clear_filter(&mut self) {
+        self.filtered_indices = None;
+        self.filter_snapshot = None;
+        self.detail = None;
+        self.list_state.select(if self.active_count() > 0 { Some(0) } else { None });
+        self.detail_scroll = 0;
     }
 }
 
@@ -307,9 +413,46 @@ fn event_loop(
         if k.kind != KeyEventKind::Press {
             continue;
         }
+
+        // --- filter input mode ---
+        if let Some(ref mut buf) = app.filter_input {
+            match k.code {
+                KeyCode::Esc => {
+                    app.filter_input = None;
+                }
+                KeyCode::Enter => {
+                    let s = std::mem::take(buf);
+                    app.filter_input = None;
+                    if s.is_empty() {
+                        app.filter_snapshot = None;
+                        app.filtered_indices = None;
+                    } else if let Ok(snap) = s.parse::<u32>() {
+                        app.apply_filter(snap);
+                    }
+                }
+                KeyCode::Backspace => {
+                    buf.pop();
+                }
+                KeyCode::Char(c) if c.is_ascii_digit() => {
+                    if buf.len() < 10 {
+                        buf.push(c);
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+
         match (k.code, k.modifiers) {
             (KeyCode::Char('q'), _) | (KeyCode::Esc, _) => break,
             (KeyCode::Char('c'), KeyModifiers::CONTROL) => break,
+            (KeyCode::Char('f'), _) => {
+                if app.filter_snapshot.is_some() {
+                    app.clear_filter();
+                } else {
+                    app.filter_input = Some(String::new());
+                }
+            }
             (KeyCode::Up, _) => app.move_by(-1),
             (KeyCode::Down, _) => app.move_by(1),
             (KeyCode::Char('k'), m) if !m.contains(KeyModifiers::SHIFT) => app.move_by(-1),
@@ -340,7 +483,7 @@ fn draw(f: &mut Frame, app: &App) {
         .constraints([
             Constraint::Length(5),
             Constraint::Min(0),
-            Constraint::Length(1),
+            Constraint::Length(if app.filter_input.is_some() { 2 } else { 1 }),
         ])
         .split(f.area());
 
@@ -351,7 +494,11 @@ fn draw(f: &mut Frame, app: &App) {
         .split(vert[1]);
     draw_list(f, body[0], app);
     draw_detail(f, body[1], app);
-    draw_help(f, vert[2]);
+    if app.filter_input.is_some() {
+        draw_filter_prompt(f, vert[2], app);
+    } else {
+        draw_help(f, vert[2]);
+    }
 }
 
 fn draw_header(f: &mut Frame, area: Rect, app: &App) {
@@ -360,18 +507,30 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
         IndexMode::AppendOnly => "Append-Only (chunks.log)",
     };
     let s = &app.stats;
+    let mut header = vec![
+        Span::raw("Path: "),
+        Span::styled(
+            app.dir.display().to_string(),
+            Style::default().fg(Color::Cyan),
+        ),
+        Span::raw("   Mode: "),
+        Span::styled(mode, Style::default().fg(Color::Yellow)),
+        Span::raw(format!("   Records: {}", s.total)),
+        Span::raw(format!("   Max snapshot: {}", app.max_snapshot)),
+    ];
+    if let Some(s) = app.filter_snapshot {
+        header.push(Span::raw("   Filter: "));
+        header.push(Span::styled(
+            format!("snap={s}"),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ));
+        header.push(Span::raw(format!(
+            "  ({} records)",
+            app.active_count()
+        )));
+    }
     let lines = vec![
-        Line::from(vec![
-            Span::raw("Path: "),
-            Span::styled(
-                app.dir.display().to_string(),
-                Style::default().fg(Color::Cyan),
-            ),
-            Span::raw("   Mode: "),
-            Span::styled(mode, Style::default().fg(Color::Yellow)),
-            Span::raw(format!("   Records: {}", s.total)),
-            Span::raw(format!("   Max snapshot: {}", app.max_snapshot)),
-        ]),
+        Line::from(header),
         Line::from(vec![
             Span::styled("Full ", Style::default().fg(Color::Green)),
             Span::raw(format!("{:>6} ({:5.1}%)   ", s.full, s.pct(s.full))),
@@ -403,35 +562,51 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_list(f: &mut Frame, area: Rect, app: &App) {
-    let items: Vec<ListItem> = app
-        .records
-        .iter()
-        .map(|r| {
-            let pa = pa_of(r.key);
-            let snap = snapshot_of(r.key);
-            let (sym, col) = kind_marker(r.kind);
+    let total = app.active_count();
+    if total == 0 {
+        return;
+    }
+    let visible = (area.height as usize).saturating_sub(2); // borders
+    let sel = app.list_state.selected().unwrap_or(0);
+
+    // Keep the selected row centered in the visible window.
+    let start = if sel < visible / 2 {
+        0
+    } else {
+        (sel - visible / 2).min(total.saturating_sub(visible))
+    };
+    let end = (start + visible).min(total);
+
+    let items: Vec<ListItem> = (start..end)
+        .map(|i| {
+            let rec = app.record_at(i);
+            let label = app.label_at(i);
+            let (sym, col) = kind_marker(rec.kind);
             ListItem::new(Line::from(vec![
                 Span::styled(
                     format!("{sym} "),
                     Style::default().fg(col).add_modifier(Modifier::BOLD),
                 ),
-                Span::raw(format!("PA=0x{pa:011x}  S={snap:>5}")),
+                Span::raw(label.to_owned()),
             ]))
         })
         .collect();
+
+    let mut state = ListState::default()
+        .with_selected(Some(sel - start))
+        .with_offset(0);
+    let title = match app.filter_snapshot {
+        Some(s) => format!("Records [{} / {}]  filter: snap={s}", total, app.records.len()),
+        None => format!("Records [{total}]"),
+    };
     let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(format!("Records [{}]", app.records.len())),
-        )
+        .block(Block::default().borders(Borders::ALL).title(title))
         .highlight_style(
             Style::default()
                 .bg(Color::DarkGray)
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol("> ");
-    let mut state = app.list_state.clone();
     f.render_stateful_widget(list, area, &mut state);
 }
 
@@ -439,7 +614,7 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &App) {
     let (title, lines) = match app.selected() {
         None => ("Detail".to_string(), vec![Line::raw("(no records)")]),
         Some(i) => {
-            let rec = &app.records[i];
+            let rec = app.record_at(i);
             let pa = pa_of(rec.key);
             let snap = snapshot_of(rec.key);
             let title = format!("Detail - PA=0x{pa:x}  S={snap}");
@@ -556,6 +731,22 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(p, area);
 }
 
+fn draw_filter_prompt(f: &mut Frame, area: Rect, app: &App) {
+    let buf = app.filter_input.as_deref().unwrap_or("");
+    let line = Line::from(vec![
+        Span::styled(
+            "Filter (snapshot id): ",
+            Style::default().fg(Color::Yellow),
+        ),
+        Span::styled(
+            if buf.is_empty() { "(type digits, Enter to apply, Esc to cancel)" }
+            else { buf },
+            Style::default().fg(Color::White),
+        ),
+    ]);
+    f.render_widget(Paragraph::new(line), area);
+}
+
 fn kind_marker(k: ChunkKind) -> (&'static str, Color) {
     match k {
         ChunkKind::Full => ("F", Color::Green),
@@ -608,6 +799,8 @@ fn draw_help(f: &mut Frame, area: Rect) {
         Span::raw("scroll detail  "),
         Span::styled(" ^U/^D ", Style::default().fg(Color::Yellow)),
         Span::raw("+/-10  "),
+        Span::styled(" f ", Style::default().fg(Color::Red)),
+        Span::raw("filter snap  "),
         Span::styled(" q ", Style::default().fg(Color::Yellow)),
         Span::raw("quit"),
     ]);
