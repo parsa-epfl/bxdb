@@ -1,3 +1,4 @@
+use std::ffi::OsStr;
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::mem;
@@ -21,6 +22,12 @@ const MUTEX_OFFSET: usize = 0;
 const SETS_OFFSET: usize = 64;
 const SET_STRIDE: usize = 192;
 
+// Identity region placed after the sets in the first metadata page.
+// Each metadata page: [mutex:64][16*sets:3072][identity:960].
+const CACHE_MAGIC: u64 = 0x4D48535F58444242; // "BBXD_SHM"
+const ID_OFFSET: usize = SETS_OFFSET + SETS_PER_META * SET_STRIDE; // 3136
+const PATH_MAX: usize = CACHE_PAGE_SIZE - ID_OFFSET - 8; // 952
+
 #[repr(C)]
 struct SetMetadata {
     page_ids: [u64; WAYS_PER_SET],
@@ -33,9 +40,7 @@ const _: () = assert!(mem::size_of::<libc::pthread_mutex_t>() <= 64);
 pub struct SharedCache {
     base: *mut u8,
     len: usize,
-    // Holding the File keeps the flock (LOCK_SH) alive for this handle's lifetime.
-    // Dropping releases the shared lock, allowing a future initializer to acquire
-    // LOCK_EX once all attached handles are gone.
+    // Keeps the file descriptor alive for the lifetime of the mmap.
     _file: File,
 }
 
@@ -53,7 +58,15 @@ impl Drop for SharedCache {
 }
 
 impl SharedCache {
-    pub fn open(path: &Path) -> io::Result<Self> {
+    /// Create and initialise a cache file.
+    ///
+    /// Truncates the file to [`TOTAL_BYTES`], writes the metadata
+    /// (mutexes, empty sets, identity), and returns.  The caller must
+    /// ensure no readers are attached while this runs.
+    ///
+    /// If the cache already exists with a matching identity this is a
+    /// no-op; if the identity mismatches the file is reinitialised.
+    pub fn create(path: &Path, identity: &Path) -> io::Result<()> {
         let file = OpenOptions::new()
             .create(true)
             .read(true)
@@ -61,66 +74,122 @@ impl SharedCache {
             .open(path)?;
         let fd = file.as_raw_fd();
 
-        // First-initializer vs. attacher coordination:
-        //   - Try LOCK_EX non-blocking. If we win, we are the initializer.
-        //   - If EX fails, another process holds EX (initializing) or SH
-        //     (already attached). Either way, LOCK_SH (blocking) resolves both
-        //     cases: it waits until the initializer downgrades.
-        //   - The initializer downgrades to LOCK_SH at the end of open() so
-        //     subsequent attachers proceed while we are still using the cache.
-        let got_ex = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } == 0;
-
-        if got_ex {
-            let size = file.metadata()?.len() as usize;
-            if size < TOTAL_BYTES {
-                if unsafe { libc::ftruncate(fd, TOTAL_BYTES as libc::off_t) } != 0 {
-                    let e = io::Error::last_os_error();
-                    unsafe { libc::flock(fd, libc::LOCK_UN) };
-                    return Err(e);
-                }
-            }
-            let base = unsafe { mmap_rw(fd)? };
-            if size < TOTAL_BYTES {
-                if let Err(e) = unsafe { init_metadata(base) } {
-                    unsafe {
-                        libc::munmap(base as *mut libc::c_void, TOTAL_BYTES);
-                        libc::flock(fd, libc::LOCK_UN);
-                    }
-                    return Err(e);
-                }
-            }
-            // Downgrade to shared; attachers waiting on LOCK_SH wake up.
-            if unsafe { libc::flock(fd, libc::LOCK_SH) } != 0 {
-                let e = io::Error::last_os_error();
-                unsafe { libc::munmap(base as *mut libc::c_void, TOTAL_BYTES) };
-                return Err(e);
-            }
-            Ok(Self {
-                base,
-                len: TOTAL_BYTES,
-                _file: file,
-            })
-        } else {
-            // Wait for SH — blocks until the current EX holder downgrades or exits.
-            if unsafe { libc::flock(fd, libc::LOCK_SH) } != 0 {
+        let size = file.metadata()?.len() as usize;
+        let needs_init = size < TOTAL_BYTES;
+        if needs_init {
+            if unsafe { libc::ftruncate(fd, TOTAL_BYTES as libc::off_t) } != 0 {
                 return Err(io::Error::last_os_error());
             }
-            let size = file.metadata()?.len() as usize;
-            if size < TOTAL_BYTES {
-                // Prior initializer died before finishing. Surface the error;
-                // the caller can retry the open.
-                unsafe { libc::flock(fd, libc::LOCK_UN) };
-                return Err(io::Error::other(
-                    "shared cache file present but not fully initialized",
-                ));
-            }
-            let base = unsafe { mmap_rw(fd)? };
-            Ok(Self {
-                base,
-                len: TOTAL_BYTES,
-                _file: file,
-            })
         }
+        let base = unsafe { mmap_rw(fd)? };
+        let doit =
+            needs_init || unsafe { verify_identity(base, identity.as_os_str()).is_err() };
+        if doit {
+            unsafe { init_metadata(base, identity.as_os_str())? };
+        }
+        unsafe { libc::munmap(base as *mut libc::c_void, TOTAL_BYTES) };
+        Ok(())
+    }
+
+    /// Attach to an existing cache that was previously created with
+    /// [`create`](Self::create).  Returns an error if the file does not
+    /// exist, has not been fully initialised, or carries a different
+    /// identity.
+    ///
+    /// Multiple readers may attach concurrently; per-set `pthread_mutex`
+    /// locks serialise access to individual cache slots.
+    pub fn open(path: &Path, identity: &Path) -> io::Result<Self> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .map_err(|e| {
+                io::Error::other(format!(
+                    "cannot open cache {:?}: {e}.  \
+                     Run `bxdb-cache create` to initialise it.",
+                    path
+                ))
+            })?;
+        let fd = file.as_raw_fd();
+
+        let size = file.metadata()?.len() as usize;
+        if size < TOTAL_BYTES {
+            return Err(io::Error::other(
+                "cache file present but not fully initialised; \
+                 run `bxdb-cache create`",
+            ));
+        }
+
+        let base = unsafe { mmap_rw(fd)? };
+        if let Err(e) = unsafe { verify_identity(base, identity.as_os_str()) } {
+            unsafe { libc::munmap(base as *mut libc::c_void, TOTAL_BYTES) };
+            return Err(e);
+        }
+
+        Ok(Self { base, len: TOTAL_BYTES, _file: file })
+    }
+
+    /// Return the identity path that was embedded at creation time.
+    pub fn identity_path(&self) -> &OsStr {
+        unsafe {
+            let start = self.base.add(ID_OFFSET + 8);
+            let mut len = 0;
+            while *start.add(len) != 0 && len < PATH_MAX {
+                len += 1;
+            }
+            OsStr::from_encoded_bytes_unchecked(
+                std::slice::from_raw_parts(start, len),
+            )
+        }
+    }
+
+    /// Total number of cache slots (ways × sets).
+    pub fn total_slots() -> usize {
+        TOTAL_SLOTS
+    }
+
+    /// Read the page-id stored in the given slot, or `None` if the slot is
+    /// empty.
+    pub fn slot_key(&self, global_slot: usize) -> Option<u64> {
+        let meta_idx = global_slot / (SETS_PER_META * WAYS_PER_SET);
+        let slot_in_page = global_slot % (SETS_PER_META * WAYS_PER_SET);
+        let set_idx = slot_in_page / WAYS_PER_SET;
+        let way = slot_in_page % WAYS_PER_SET;
+
+        let page_base = unsafe { self.base.add(meta_idx * CACHE_PAGE_SIZE) };
+        let set = unsafe { set_ptr(page_base, set_idx) };
+        let key = unsafe { (*set).page_ids[way] };
+        if key == EMPTY_KEY {
+            None
+        } else {
+            Some(key)
+        }
+    }
+
+    /// Read the LRU timestamp for a slot (0 = least recently used, 255 =
+    /// most recently used).
+    pub fn slot_timestamp(&self, global_slot: usize) -> u8 {
+        let meta_idx = global_slot / (SETS_PER_META * WAYS_PER_SET);
+        let slot_in_page = global_slot % (SETS_PER_META * WAYS_PER_SET);
+        let set_idx = slot_in_page / WAYS_PER_SET;
+        let way = slot_in_page % WAYS_PER_SET;
+
+        let page_base = unsafe { self.base.add(meta_idx * CACHE_PAGE_SIZE) };
+        let set = unsafe { set_ptr(page_base, set_idx) };
+        unsafe { (*set).timestamps[way] }
+    }
+
+    /// Copy the page data at the given global slot into `out`.
+    pub fn read_slot_page(
+        &self,
+        global_slot: usize,
+        out: &mut [u8; CACHE_PAGE_SIZE],
+    ) {
+        let data = unsafe {
+            self.base
+                .add(METADATA_BYTES + global_slot * CACHE_PAGE_SIZE)
+        };
+        unsafe { ptr::copy_nonoverlapping(data, out.as_mut_ptr(), CACHE_PAGE_SIZE) };
     }
 
     pub fn get(&self, key: u64, out: &mut [u8; CACHE_PAGE_SIZE]) -> bool {
@@ -328,7 +397,41 @@ unsafe fn mmap_rw(fd: i32) -> io::Result<*mut u8> {
     Ok(raw as *mut u8)
 }
 
-unsafe fn init_metadata(base: *mut u8) -> io::Result<()> {
+unsafe fn write_identity(base: *mut u8, identity: &std::ffi::OsStr) {
+    unsafe { ptr::write_unaligned(base.add(ID_OFFSET) as *mut u64, CACHE_MAGIC) };
+    let path_bytes = identity.as_encoded_bytes();
+    let len = path_bytes.len().min(PATH_MAX);
+    unsafe {
+        ptr::copy_nonoverlapping(path_bytes.as_ptr(), base.add(ID_OFFSET + 8), len);
+        if len < PATH_MAX {
+            ptr::write(base.add(ID_OFFSET + 8 + len), 0u8);
+        }
+    }
+}
+
+unsafe fn verify_identity(base: *mut u8, expected: &std::ffi::OsStr) -> io::Result<()> {
+    let magic = unsafe { ptr::read_unaligned(base.add(ID_OFFSET) as *mut u64) };
+    if magic != CACHE_MAGIC {
+        return Err(io::Error::other("shared cache corrupted: invalid magic"));
+    }
+    let stored = unsafe {
+        let start = base.add(ID_OFFSET + 8);
+        let mut len = 0;
+        while *start.add(len) != 0 && len < PATH_MAX {
+            len += 1;
+        }
+        std::ffi::OsStr::from_encoded_bytes_unchecked(std::slice::from_raw_parts(start, len))
+    };
+    if stored != expected {
+        return Err(io::Error::other(format!(
+            "shared cache identity mismatch: cache belongs to {:?}, expected {:?}",
+            stored, expected
+        )));
+    }
+    Ok(())
+}
+
+unsafe fn init_metadata(base: *mut u8, identity: &std::ffi::OsStr) -> io::Result<()> {
     unsafe { ptr::write_bytes(base, 0, METADATA_BYTES) };
 
     let mut attr: libc::pthread_mutexattr_t = unsafe { mem::zeroed() };
@@ -365,5 +468,6 @@ unsafe fn init_metadata(base: *mut u8) -> io::Result<()> {
     }
 
     unsafe { libc::pthread_mutexattr_destroy(&mut attr) };
+    unsafe { write_identity(base, identity) };
     Ok(())
 }

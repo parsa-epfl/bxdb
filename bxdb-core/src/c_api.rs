@@ -1,10 +1,12 @@
 use std::ffi::{CStr, c_char, c_int};
+use std::path::Path;
 use std::ptr;
 use std::slice;
 
+use crate::cache;
 use crate::chunk::PAGE_SIZE;
 use crate::append_only::AppendOnlyDb;
-use crate::btree::BtreeDb;
+use crate::btree::{self, BtreeDb};
 
 pub enum BxdbHandle {
     Dummy,
@@ -136,4 +138,45 @@ pub unsafe extern "C" fn bxdb_load_all_pages(
             worker_count.max(1) as usize,
         )
         .unwrap_or(false)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bxdb_cache_create(name: *const c_char) -> bool {
+    if name.is_null() {
+        return false;
+    }
+    let name = match unsafe { CStr::from_ptr(name) }.to_str() {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let dir = Path::new(name);
+    let canonical = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    let cache_path = match btree::shm_cache_path(&canonical) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    cache::SharedCache::create(&cache_path, &canonical).is_ok()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bxdb_cache_delete(name: *const c_char) -> bool {
+    if name.is_null() {
+        return false;
+    }
+    let name = match unsafe { CStr::from_ptr(name) }.to_str() {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let dir = Path::new(name);
+    let canonical = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    let cache_path = match btree::shm_cache_path(&canonical) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    let ok = std::fs::remove_file(&cache_path).is_ok();
+    // Also try to remove the parent hash directory.
+    if let Some(parent) = cache_path.parent() {
+        let _ = std::fs::remove_dir(parent);
+    }
+    ok
 }

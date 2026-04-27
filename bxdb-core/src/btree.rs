@@ -284,11 +284,33 @@ pub struct BtreeDb {
     cache: SharedCache,
 }
 
+pub fn shm_cache_path(dir: &Path) -> io::Result<PathBuf> {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = rustc_hash::FxHasher::default();
+    // Mix (dev, ino) with the path bytes: filesystem identity prevents
+    // collision across databases, path salt guards against reuse on
+    // ephemeral filesystems where inode numbers cycle fast.
+    match std::fs::metadata(dir) {
+        Ok(meta) => {
+            use std::os::unix::fs::MetadataExt;
+            meta.dev().hash(&mut hasher);
+            meta.ino().hash(&mut hasher);
+        }
+        Err(_) => {}
+    }
+    dir.as_os_str().hash(&mut hasher);
+    let hash = hasher.finish();
+    let shm_dir = PathBuf::from("/dev/shm/bxdb").join(format!("{:016x}", hash));
+    std::fs::create_dir_all(&shm_dir)?;
+    Ok(shm_dir.join("cache.shm"))
+}
+
 impl BtreeDb {
     pub fn open(name: impl AsRef<Path>) -> io::Result<Self> {
         let dir = name.as_ref().to_path_buf();
+        let canonical = dir.canonicalize().unwrap_or_else(|_| dir.clone());
         let store = PageStore::open(&dir)?;
-        let cache = SharedCache::open(&dir.join("cache.shm"))?;
+        let cache = SharedCache::open(&shm_cache_path(&canonical)?, &canonical)?;
         Ok(Self { _dir: dir, store, cache })
     }
 

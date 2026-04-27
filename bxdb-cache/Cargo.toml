@@ -1,0 +1,7 @@
+[package]
+name = "bxdb-cache"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bxdb = { package = "bxdb-core", path = "../bxdb-core" }

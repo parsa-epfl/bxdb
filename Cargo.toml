@@ -1,5 +1,5 @@
 [workspace]
-members = ["bxdb-core", "bxdb-util", "bxdb-inspect"]
+members = ["bxdb-core", "bxdb-util", "bxdb-inspect", "bxdb-cache"]
 resolver = "3"
 
 [profile.release]

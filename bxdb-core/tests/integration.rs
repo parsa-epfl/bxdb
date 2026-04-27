@@ -1,4 +1,5 @@
-use std::path::Path;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use bxdb::cache::{SharedCache, TOTAL_BYTES};
@@ -8,6 +9,29 @@ use bxdb::{AppendOnlyDb, IndexMode, BtreeDb};
 use rand::{Rng, SeedableRng};
 use rand::rngs::StdRng;
 use tempfile::TempDir;
+
+/// Thin wrapper that deletes the shared-memory cache file on drop.
+struct TestReader {
+    db: BtreeDb,
+    cache_path: PathBuf,
+}
+
+impl Drop for TestReader {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.cache_path);
+        // Try to remove the parent hash dir (ok if not empty).
+        if let Some(parent) = self.cache_path.parent() {
+            let _ = fs::remove_dir(parent);
+        }
+    }
+}
+
+impl std::ops::Deref for TestReader {
+    type Target = BtreeDb;
+    fn deref(&self) -> &BtreeDb {
+        &self.db
+    }
+}
 
 fn make_memory(n_pages: usize) -> Vec<u8> {
     vec![0u8; n_pages * PAGE_SIZE]
@@ -33,8 +57,16 @@ fn get_page(memory: &[u8], i: usize) -> [u8; PAGE_SIZE] {
     memory[start..start + PAGE_SIZE].try_into().unwrap()
 }
 
-fn open_read(dir: &Path) -> BtreeDb {
-    BtreeDb::open(dir).expect("open btree")
+fn open_read(dir: &Path) -> TestReader {
+    let canonical = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    let cache_path = bxdb::shm_cache_path(&canonical).unwrap();
+    if !cache_path.exists() {
+        bxdb::cache::SharedCache::create(&cache_path, &canonical).expect("cache create");
+    }
+    TestReader {
+        db: BtreeDb::open(dir).expect("open btree"),
+        cache_path,
+    }
 }
 
 fn convert_to_btree(dir: &Path) {
@@ -398,7 +430,8 @@ fn bxdb_convert_binary_runs() {
 fn shared_cache_basic_hit_and_evict() {
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("c.shm");
-    let cache = SharedCache::open(&path).unwrap();
+    SharedCache::create(&path, tmp.path()).unwrap();
+    let cache = SharedCache::open(&path, tmp.path()).unwrap();
 
     let mut out = [0u8; PAGE_SIZE];
     assert!(!cache.get(42, &mut out), "empty cache shouldn't hit");
@@ -438,8 +471,9 @@ fn shared_cache_basic_hit_and_evict() {
 fn shared_cache_file_sized_and_reattaches() {
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("c.shm");
+    SharedCache::create(&path, tmp.path()).unwrap();
     {
-        let c = SharedCache::open(&path).unwrap();
+        let c = SharedCache::open(&path, tmp.path()).unwrap();
         let page = [1u8; PAGE_SIZE];
         c.put(999, &page);
     }
@@ -447,7 +481,7 @@ fn shared_cache_file_sized_and_reattaches() {
     assert_eq!(meta.len() as usize, TOTAL_BYTES, "cache file size mismatch");
 
     // Re-attach; existing entry should survive because the file backs the cache.
-    let c = SharedCache::open(&path).unwrap();
+    let c = SharedCache::open(&path, tmp.path()).unwrap();
     let mut out = [0u8; PAGE_SIZE];
     assert!(c.get(999, &mut out));
     assert!(out.iter().all(|&b| b == 1));
@@ -473,20 +507,20 @@ fn readdb_uses_shared_cache_file() {
     convert_to_btree(&dir);
 
     {
+        let cache_path = bxdb::shm_cache_path(&dir).unwrap();
         let rdb = open_read(&dir);
         for i in 0..n_pages {
             assert_eq!(rdb.load_page(i, 1).unwrap().unwrap(), pages[i as usize]);
         }
-    }
-    // First read populated the cache; verify the file exists at spec'd size.
-    let cache_path = dir.join("cache.shm");
-    let meta = std::fs::metadata(&cache_path).unwrap();
-    assert_eq!(meta.len() as usize, TOTAL_BYTES);
+        // Cache file exists and is the expected size while reader is alive.
+        let meta = fs::metadata(&cache_path).unwrap();
+        assert_eq!(meta.len() as usize, TOTAL_BYTES);
 
-    // Reopen — reuses existing cache file.
-    let rdb = open_read(&dir);
-    for i in 0..n_pages {
-        assert_eq!(rdb.load_page(i, 1).unwrap().unwrap(), pages[i as usize]);
+        // Reopen — reuses existing cache file.
+        let rdb2 = open_read(&dir);
+        for i in 0..n_pages {
+            assert_eq!(rdb2.load_page(i, 1).unwrap().unwrap(), pages[i as usize]);
+        }
     }
 }
 

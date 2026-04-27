@@ -18,6 +18,6 @@ pub mod purge;
 pub mod append_only;
 pub mod btree;
 
-pub use btree::{IndexMode, BtreeDb};
+pub use btree::{IndexMode, BtreeDb, shm_cache_path};
 pub use append_only::AppendOnlyDb;
 pub use chunk::{DEFAULT_DELTA_THRESHOLD, MAX_SNAPSHOT_ID, PAGE_SIZE, encode_key};
