@@ -12,7 +12,8 @@ use crate::format::{read_and_verify_header, write_index_header, write_log_header
 /// than `snapshot_threshold`.
 ///
 /// Accepts both B-tree (`index.bxdb`) and append-only log (`chunks.log`)
-/// formats as input, and preserves the source format in the output.
+/// formats as input, and preserves any existing format in the output.
+/// If both formats are present, both are rewritten so they stay in sync.
 ///
 /// Because snapshot ids grow monotonically, blob data within each worker file
 /// is laid out in snapshot order. This function exploits that property by
@@ -24,17 +25,22 @@ pub fn purge(dir: &Path, snapshot_threshold: u32) -> io::Result<usize> {
     let idx_path = dir.join("index.bxdb");
     let log_path = dir.join("chunks.log");
 
-    let from_log = !idx_path.exists() && log_path.exists();
+    let has_idx = idx_path.exists();
+    let has_log = log_path.exists();
 
-    let mut records = if !from_log && idx_path.exists() {
-        read_index(&idx_path)?
-    } else if log_path.exists() {
-        read_log(&log_path)?
-    } else {
+    if !has_idx && !has_log {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
             "neither index.bxdb nor chunks.log found",
         ));
+    }
+
+    // Read from the btree index if available (faster), otherwise from the log.
+    // Both formats represent the same record set, so we only need to read one.
+    let mut records = if has_idx {
+        read_index(&idx_path)?
+    } else {
+        read_log(&log_path)?
     };
 
     let before = records.len();
@@ -54,10 +60,11 @@ pub fn purge(dir: &Path, snapshot_threshold: u32) -> io::Result<usize> {
     truncate_blobs(dir, &records)?;
     cleanup_unused_blob_files(dir, &records)?;
 
-    if from_log {
-        write_log_file(dir, &records, max_snap)?;
-    } else {
+    if has_idx {
         write_index_file(dir, &records, max_snap)?;
+    }
+    if has_log {
+        write_log_file(dir, &records, max_snap)?;
     }
 
     Ok(removed)
