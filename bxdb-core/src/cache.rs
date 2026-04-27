@@ -106,7 +106,7 @@ impl SharedCache {
             .map_err(|e| {
                 io::Error::other(format!(
                     "cannot open cache {:?}: {e}.  \
-                     Run `bxdb-cache create` to initialise it.",
+                     Run `bxdb cache create` to initialise it.",
                     path
                 ))
             })?;
@@ -116,7 +116,7 @@ impl SharedCache {
         if size < TOTAL_BYTES {
             return Err(io::Error::other(
                 "cache file present but not fully initialised; \
-                 run `bxdb-cache create`",
+                 run `bxdb cache create`",
             ));
         }
 

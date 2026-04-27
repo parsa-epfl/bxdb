@@ -48,7 +48,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         std.debug.print(
             \\Failed to open DB at "{s}" for reading.
             \\The shared-memory page cache must be created first:
-            \\  bxdb-cache create "{s}"
+            \\  bxdb cache create "{s}"
             \\
         , .{ db_path, db_path });
         return error.OpenFailed;

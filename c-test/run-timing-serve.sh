@@ -15,7 +15,7 @@ zig build-exe "$SCRIPT_DIR/timing-serve.zig" "$SCRIPT_DIR_PARENT/target/release/
     -femit-bin="$SCRIPT_DIR/timing-serve"
 
 echo "Converting $DB to B-tree..."
-"$SCRIPT_DIR_PARENT/target/release/bxdb-convert" to-btree "$DB"
+"$SCRIPT_DIR_PARENT/target/release/bxdb" convert to-btree "$DB"
 
 echo "--- Attempting to read WITHOUT cache (should fail) ---"
 if "$SCRIPT_DIR/timing-serve" "$BTREE_NAME" "$SNAP" 0 2>&1; then
@@ -27,7 +27,7 @@ fi
 
 echo ""
 echo "Creating shared-memory page cache..."
-"$SCRIPT_DIR_PARENT/target/release/bxdb-cache" create "$BTREE_NAME"
+"$SCRIPT_DIR_PARENT/target/release/bxdb" cache create "$BTREE_NAME"
 
 echo "Starting 64 timing-serve processes against $BTREE_NAME (snapshot $SNAP)..."
 
@@ -45,7 +45,7 @@ echo "All 64 processes done. CSV files: timing_latencies_*.csv"
 
 echo ""
 echo "Cleaning up cache..."
-"$SCRIPT_DIR_PARENT/target/release/bxdb-cache" delete "$BTREE_NAME"
+"$SCRIPT_DIR_PARENT/target/release/bxdb" cache delete "$BTREE_NAME"
 
 echo ""
 echo "Done."
