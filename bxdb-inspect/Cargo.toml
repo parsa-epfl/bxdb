@@ -11,9 +11,5 @@ crossterm = "0.28"
 zstd = "0.13"
 
 [[bin]]
-name = "perf-profile"
-path = "src/bin/perf_profile.rs"
-
-[[bin]]
 name = "bxdb-inspect"
 path = "src/main.rs"
