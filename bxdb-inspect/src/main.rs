@@ -208,7 +208,8 @@ struct App {
     dir: PathBuf,
     mode: IndexMode,
     records: Vec<ChunkRecord>,
-    record_labels: Vec<String>,
+
+
     stats: Stats,
     max_snapshot: u32,
     list_state: ListState,
@@ -233,19 +234,10 @@ impl App {
         if !records.is_empty() {
             list_state.select(Some(0));
         }
-        let record_labels = records
-            .iter()
-            .map(|r| {
-                let pa = pa_of(r.key);
-                let snap = snapshot_of(r.key);
-                format!("PA=0x{pa:011x}  S={snap:>5}")
-            })
-            .collect();
         Self {
             dir,
             mode,
             records,
-            record_labels,
             stats,
             max_snapshot,
             list_state,
@@ -341,10 +333,6 @@ impl App {
 
     fn record_at(&self, active_idx: usize) -> &ChunkRecord {
         &self.records[self.real_idx(active_idx)]
-    }
-
-    fn label_at(&self, active_idx: usize) -> &str {
-        &self.record_labels[self.real_idx(active_idx)]
     }
 
     fn apply_filter(&mut self, snap: u32) {
@@ -580,7 +568,9 @@ fn draw_list(f: &mut Frame, area: Rect, app: &App) {
     let items: Vec<ListItem> = (start..end)
         .map(|i| {
             let rec = app.record_at(i);
-            let label = app.label_at(i);
+            let pa = pa_of(rec.key);
+            let snap = snapshot_of(rec.key);
+            let label = format!("PA=0x{pa:011x}  S={snap:>5}");
             let (sym, col) = kind_marker(rec.kind);
             ListItem::new(Line::from(vec![
                 Span::styled(
