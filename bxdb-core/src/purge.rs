@@ -147,15 +147,14 @@ fn write_log_file(dir: &Path, records: &[ChunkRecord], max_snap: u32) -> io::Res
 
     // Group records by snapshot_id so the output log preserves the
     // monotonic snapshot invariant (same order save_pages produces).
+    // Records enter key-sorted from read_index / read_log, so each
+    // group is already sorted by key — no per-group sort needed.
     let mut by_snap: FxHashMap<u32, Vec<ChunkRecord>> = FxHashMap::default();
     for rec in records {
         by_snap.entry(snapshot_of(rec.key)).or_default().push(*rec);
     }
     let mut snaps: Vec<u32> = by_snap.keys().copied().collect();
     snaps.sort_unstable();
-    for group in by_snap.values_mut() {
-        group.sort_by_key(|r| r.key);
-    }
 
     {
         let f = OpenOptions::new()
