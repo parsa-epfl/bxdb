@@ -69,3 +69,7 @@ bool bxdb_load_all_pages(struct BxdbHandle *db,
                          uint64_t total_page_count,
                          uint32_t snapshot_id,
                          int worker_count);
+
+bool bxdb_cache_create(const char *name);
+
+bool bxdb_cache_delete(const char *name);

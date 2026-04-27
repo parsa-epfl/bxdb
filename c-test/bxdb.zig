@@ -20,3 +20,5 @@ pub extern fn bxdb_load_all_pages(
     snapshot_id: u32,
     worker_count: i32,
 ) bool;
+pub extern fn bxdb_cache_create(name: [*:0]const u8) bool;
+pub extern fn bxdb_cache_delete(name: [*:0]const u8) bool;
