@@ -29,6 +29,7 @@ use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     let mut cli_snapshot: Option<u32> = None;
+    let mut cli_pa: Option<u64> = None;
     let mut db_arg: Option<&str> = None;
     let mut i = 1;
     while i < args.len() {
@@ -41,13 +42,28 @@ fn main() -> ExitCode {
                 }
             }
             i += 2;
+        } else if args[i] == "--pa" && i + 1 < args.len() {
+            let val = &args[i + 1];
+            let hex = if val.starts_with("0x") || val.starts_with("0X") {
+                &val[2..]
+            } else {
+                val
+            };
+            match u64::from_str_radix(hex, 16) {
+                Ok(p) => cli_pa = Some(p),
+                Err(_) => {
+                    eprintln!("bxdb-inspect: invalid pa (expected hex): {}", val);
+                    return ExitCode::from(2);
+                }
+            }
+            i += 2;
         } else {
             db_arg = Some(&args[i]);
             i += 1;
         }
     }
     let Some(db_arg) = db_arg else {
-        eprintln!("usage: {} [--snapshot N] <db-dir>", args[0]);
+        eprintln!("usage: {} [--snapshot N] [--pa HEX] <db-dir>", args[0]);
         return ExitCode::from(2);
     };
     let dir = PathBuf::from(db_arg);
@@ -60,8 +76,8 @@ fn main() -> ExitCode {
     };
     let stats = Stats::from_records(&records);
     let mut app = App::new(dir, mode, records, stats, max_snap);
-    if let Some(snap) = cli_snapshot {
-        app.apply_filter(snap);
+    if cli_snapshot.is_some() || cli_pa.is_some() {
+        app.apply_filter(cli_snapshot, cli_pa);
     }
     if let Err(e) = run(app) {
         eprintln!("bxdb-inspect: {e}");
@@ -217,8 +233,11 @@ struct App {
     detail_scroll: u16,
     detail: Option<(usize, Detail)>,
     filter_snapshot: Option<u32>,
+    filter_pa: Option<u64>,
     filtered_indices: Option<Vec<usize>>,
     filter_input: Option<String>,
+    export_input: Option<String>,
+    export_status: Option<String>,
 }
 
 enum Detail {
@@ -245,8 +264,11 @@ impl App {
             detail_scroll: 0,
             detail: None,
             filter_snapshot: None,
+            filter_pa: None,
             filtered_indices: None,
             filter_input: None,
+            export_input: None,
+            export_status: None,
         }
     }
 
@@ -335,16 +357,29 @@ impl App {
         &self.records[self.real_idx(active_idx)]
     }
 
-    fn apply_filter(&mut self, snap: u32) {
+    fn apply_filter(&mut self, snap: Option<u32>, pa: Option<u64>) {
         let indices: Vec<usize> = self
             .records
             .iter()
             .enumerate()
-            .filter(|(_, r)| snapshot_of(r.key) == snap)
+            .filter(|(_, r)| {
+                if let Some(s) = snap {
+                    if snapshot_of(r.key) != s {
+                        return false;
+                    }
+                }
+                if let Some(p) = pa {
+                    if pa_of(r.key) != p {
+                        return false;
+                    }
+                }
+                true
+            })
             .map(|(i, _)| i)
             .collect();
         self.filtered_indices = Some(indices);
-        self.filter_snapshot = Some(snap);
+        self.filter_snapshot = snap;
+        self.filter_pa = pa;
         self.detail = None;
         self.list_state.select(if self.active_count() > 0 { Some(0) } else { None });
         self.detail_scroll = 0;
@@ -353,9 +388,23 @@ impl App {
     fn clear_filter(&mut self) {
         self.filtered_indices = None;
         self.filter_snapshot = None;
+        self.filter_pa = None;
         self.detail = None;
         self.list_state.select(if self.active_count() > 0 { Some(0) } else { None });
         self.detail_scroll = 0;
+    }
+
+    fn export_detail(&mut self, path: &str) {
+        let msg = match &self.detail {
+            Some((_, Detail::Full { decompressed })) => {
+                match std::fs::write(path, decompressed) {
+                    Ok(()) => format!("Exported {} bytes to {path}", decompressed.len()),
+                    Err(e) => format!("Export error: {e}"),
+                }
+            }
+            _ => "Nothing to export (select a Full chunk)".to_string(),
+        };
+        self.export_status = Some(msg);
     }
 }
 
@@ -370,6 +419,26 @@ fn decode_delta(blob: &[u8]) -> Result<Vec<(u16, u64)>, String> {
         out.push((idx, v));
     }
     Ok(out)
+}
+
+fn parse_filter_input(s: &str) -> (Option<u32>, Option<u64>) {
+    let mut snap = None;
+    let mut pa = None;
+    for token in s.split_whitespace() {
+        if token.is_empty() {
+            continue;
+        }
+        if token.starts_with("0x") || token.starts_with("0X") {
+            if let Ok(p) = u64::from_str_radix(&token[2..], 16) {
+                pa = Some(p);
+            }
+        } else if token.chars().all(|c| c.is_ascii_digit()) {
+            if let Ok(s) = token.parse::<u32>() {
+                snap = Some(s);
+            }
+        }
+    }
+    (snap, pa)
 }
 
 // --- terminal lifecycle -----------------------------------------------------
@@ -412,17 +481,19 @@ fn event_loop(
                     let s = std::mem::take(buf);
                     app.filter_input = None;
                     if s.is_empty() {
-                        app.filter_snapshot = None;
-                        app.filtered_indices = None;
-                    } else if let Ok(snap) = s.parse::<u32>() {
-                        app.apply_filter(snap);
+                        app.clear_filter();
+                    } else {
+                        let (snap, pa) = parse_filter_input(&s);
+                        if snap.is_some() || pa.is_some() {
+                            app.apply_filter(snap, pa);
+                        }
                     }
                 }
                 KeyCode::Backspace => {
                     buf.pop();
                 }
-                KeyCode::Char(c) if c.is_ascii_digit() => {
-                    if buf.len() < 10 {
+                KeyCode::Char(c) if c.is_ascii_hexdigit() || c == 'x' || c == 'X' || c == ' ' => {
+                    if buf.len() < 40 {
                         buf.push(c);
                     }
                 }
@@ -431,14 +502,48 @@ fn event_loop(
             continue;
         }
 
+        // --- export input mode ---
+        if let Some(ref mut path) = app.export_input {
+            match k.code {
+                KeyCode::Esc => {
+                    app.export_input = None;
+                }
+                KeyCode::Enter => {
+                    let p = std::mem::take(path);
+                    app.export_input = None;
+                    if !p.is_empty() {
+                        app.export_detail(&p);
+                    }
+                }
+                KeyCode::Backspace => {
+                    path.pop();
+                }
+                KeyCode::Char(c) if !c.is_control() => {
+                    if path.len() < 255 {
+                        path.push(c);
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+
+        app.export_status = None;
         match (k.code, k.modifiers) {
             (KeyCode::Char('q'), _) | (KeyCode::Esc, _) => break,
             (KeyCode::Char('c'), KeyModifiers::CONTROL) => break,
             (KeyCode::Char('f'), _) => {
-                if app.filter_snapshot.is_some() {
+                if app.filter_snapshot.is_some() || app.filter_pa.is_some() {
                     app.clear_filter();
                 } else {
                     app.filter_input = Some(String::new());
+                }
+            }
+            (KeyCode::Char('e'), _) => {
+                if let Some(i) = app.selected() {
+                    if app.record_at(i).kind == ChunkKind::Full {
+                        app.export_input = Some(String::new());
+                    }
                 }
             }
             (KeyCode::Up, _) => app.move_by(-1),
@@ -471,7 +576,7 @@ fn draw(f: &mut Frame, app: &App) {
         .constraints([
             Constraint::Length(5),
             Constraint::Min(0),
-            Constraint::Length(if app.filter_input.is_some() { 2 } else { 1 }),
+            Constraint::Length(if app.filter_input.is_some() || app.export_input.is_some() { 2 } else { 1 }),
         ])
         .split(f.area());
 
@@ -482,8 +587,12 @@ fn draw(f: &mut Frame, app: &App) {
         .split(vert[1]);
     draw_list(f, body[0], app);
     draw_detail(f, body[1], app);
-    if app.filter_input.is_some() {
+    if let Some(ref path) = app.export_input {
+        draw_export_prompt(f, vert[2], path);
+    } else if app.filter_input.is_some() {
         draw_filter_prompt(f, vert[2], app);
+    } else if let Some(ref status) = app.export_status {
+        draw_status(f, vert[2], status);
     } else {
         draw_help(f, vert[2]);
     }
@@ -512,6 +621,19 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
             format!("snap={s}"),
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         ));
+    }
+    if let Some(p) = app.filter_pa {
+        if app.filter_snapshot.is_some() {
+            header.push(Span::raw("  "));
+        } else {
+            header.push(Span::raw("   Filter: "));
+        }
+        header.push(Span::styled(
+            format!("pa=0x{p:x}"),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ));
+    }
+    if app.filter_snapshot.is_some() || app.filter_pa.is_some() {
         header.push(Span::raw(format!(
             "  ({} records)",
             app.active_count()
@@ -585,9 +707,11 @@ fn draw_list(f: &mut Frame, area: Rect, app: &App) {
     let mut state = ListState::default()
         .with_selected(Some(sel - start))
         .with_offset(0);
-    let title = match app.filter_snapshot {
-        Some(s) => format!("Records [{} / {}]  filter: snap={s}", total, app.records.len()),
-        None => format!("Records [{total}]"),
+    let title = match (app.filter_snapshot, app.filter_pa) {
+        (Some(s), Some(p)) => format!("Records [{} / {}]  filter: snap={s} pa=0x{p:x}", total, app.records.len()),
+        (Some(s), None) => format!("Records [{} / {}]  filter: snap={s}", total, app.records.len()),
+        (None, Some(p)) => format!("Records [{} / {}]  filter: pa=0x{p:x}", total, app.records.len()),
+        (None, None) => format!("Records [{total}]"),
     };
     let list = List::new(items)
         .block(Block::default().borders(Borders::ALL).title(title))
@@ -725,11 +849,11 @@ fn draw_filter_prompt(f: &mut Frame, area: Rect, app: &App) {
     let buf = app.filter_input.as_deref().unwrap_or("");
     let line = Line::from(vec![
         Span::styled(
-            "Filter (snapshot id): ",
+            "Filter (snapshot and/or PA, e.g. 42 0x1234): ",
             Style::default().fg(Color::Yellow),
         ),
         Span::styled(
-            if buf.is_empty() { "(type digits, Enter to apply, Esc to cancel)" }
+            if buf.is_empty() { "(Enter to apply, Esc to cancel)" }
             else { buf },
             Style::default().fg(Color::White),
         ),
@@ -786,13 +910,37 @@ fn draw_help(f: &mut Frame, area: Rect) {
         Span::styled(" g/G ", Style::default().fg(Color::Yellow)),
         Span::raw("top/bot  "),
         Span::styled(" J/K ", Style::default().fg(Color::Yellow)),
-        Span::raw("scroll detail  "),
+        Span::raw("scroll  "),
         Span::styled(" ^U/^D ", Style::default().fg(Color::Yellow)),
         Span::raw("+/-10  "),
         Span::styled(" f ", Style::default().fg(Color::Red)),
-        Span::raw("filter snap  "),
+        Span::raw("filter  "),
+        Span::styled(" e ", Style::default().fg(Color::Green)),
+        Span::raw("export  "),
         Span::styled(" q ", Style::default().fg(Color::Yellow)),
         Span::raw("quit"),
+    ]);
+    f.render_widget(Paragraph::new(line), area);
+}
+
+fn draw_export_prompt(f: &mut Frame, area: Rect, path: &str) {
+    let line = Line::from(vec![
+        Span::styled(
+            "Export file: ",
+            Style::default().fg(Color::Yellow),
+        ),
+        Span::styled(
+            if path.is_empty() { "(type filename, Enter to save, Esc to cancel)" }
+            else { path },
+            Style::default().fg(Color::White),
+        ),
+    ]);
+    f.render_widget(Paragraph::new(line), area);
+}
+
+fn draw_status(f: &mut Frame, area: Rect, msg: &str) {
+    let line = Line::from(vec![
+        Span::styled(msg, Style::default().fg(Color::Green)),
     ]);
     f.render_widget(Paragraph::new(line), area);
 }
