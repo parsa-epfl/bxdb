@@ -97,8 +97,8 @@ pub fn main() !void {
         // load the DB.
         const db = bxdb.bxdb_open_for_append_only(db_name, 1, 0, true);
 
-        const temporal_buf = try allocator.alloc(u8, 4096 * 3);
-        defer allocator.free(temporal_buf);
+        const temporal_buf = try std.heap.page_allocator.alloc(u8, 4096 * 3);
+        defer std.heap.page_allocator.free(temporal_buf);
 
         _ = bxdb.bxdb_load_all_pages(db, temporal_buf.ptr, 0, 3, @intCast(id), 1);
 

@@ -1,4 +1,5 @@
 use std::fs;
+use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -33,8 +34,63 @@ impl std::ops::Deref for TestReader {
     }
 }
 
-fn make_memory(n_pages: usize) -> Vec<u8> {
-    vec![0u8; n_pages * PAGE_SIZE]
+struct MmapBuf {
+    ptr: *mut u8,
+    len: usize,
+}
+
+impl MmapBuf {
+    fn new(n_pages: usize) -> Self {
+        let len = n_pages * PAGE_SIZE;
+        if len == 0 {
+            return Self { ptr: std::ptr::null_mut(), len: 0 };
+        }
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert!(ptr != libc::MAP_FAILED, "mmap failed for {len} bytes");
+        Self { ptr: ptr as *mut u8, len }
+    }
+}
+
+impl Deref for MmapBuf {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        if self.len == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+        }
+    }
+}
+
+impl DerefMut for MmapBuf {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        if self.len == 0 {
+            &mut []
+        } else {
+            unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+        }
+    }
+}
+
+impl Drop for MmapBuf {
+    fn drop(&mut self) {
+        if self.len > 0 {
+            unsafe { libc::munmap(self.ptr as *mut libc::c_void, self.len); }
+        }
+    }
+}
+
+fn make_memory(n_pages: usize) -> MmapBuf {
+    MmapBuf::new(n_pages)
 }
 
 fn set_dirty(bitmap: &mut [u64], i: u64) {
@@ -698,4 +754,82 @@ fn save_pages_rejects_non_monotonic_snapshots() {
 
     // Higher snapshot still works.
     append_db.save_pages(&memory, &bitmap, n_pages, 6).unwrap();
+}
+
+#[test]
+fn batch_load_zero_pages_recovered_without_write() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("db");
+
+    let n_pages = 16u64;
+    let mut rng = StdRng::seed_from_u64(42);
+
+    // Prepare: pages 0, 3, 7, 12 are non-zero; the rest are zero.
+    let mut memory = make_memory(n_pages as usize);
+    let mut bitmap = vec![0u64; 1];
+    let non_zero_indices: [usize; 4] = [0, 3, 7, 12];
+    let mut expected: Vec<[u8; PAGE_SIZE]> = vec![[0u8; PAGE_SIZE]; n_pages as usize];
+    for &i in &non_zero_indices {
+        let p = random_page(&mut rng);
+        set_page(&mut memory, i, &p);
+        expected[i] = p;
+        set_dirty(&mut bitmap, i as u64);
+    }
+    // Also mark zero pages as dirty so they are saved explicitly.
+    for i in 0..n_pages as usize {
+        set_dirty(&mut bitmap, i as u64);
+    }
+
+    let mut wdb = AppendOnlyDb::open(&dir, 2, 128, true).unwrap();
+    wdb.save_pages(&memory, &bitmap, n_pages, 10).unwrap();
+    drop(wdb);
+
+    // --- Scan mode (append-only, no conversion) ---
+    {
+        let db = AppendOnlyDb::open(&dir, 2, 128, true).unwrap();
+        let mut out = make_memory(n_pages as usize);
+        let ok = db.load_all_pages(&mut out, 0, n_pages, 10, 2).unwrap();
+        assert!(ok);
+        for i in 0..n_pages as usize {
+            assert_eq!(
+                get_page(&out, i),
+                expected[i],
+                "scan mode: page {i}"
+            );
+        }
+    }
+
+    // --- Btree mode (after conversion) ---
+    convert_to_btree(&dir);
+    {
+        let db = AppendOnlyDb::open(&dir, 2, 128, true).unwrap();
+        let mut out = make_memory(n_pages as usize);
+        let ok = db.load_all_pages(&mut out, 0, n_pages, 10, 2).unwrap();
+        assert!(ok);
+        for i in 0..n_pages as usize {
+            assert_eq!(
+                get_page(&out, i),
+                expected[i],
+                "btree mode: page {i}"
+            );
+        }
+    }
+
+    // --- Subrange with pa_offset, includes a zero page at the start ---
+    {
+        let db = AppendOnlyDb::open(&dir, 2, 128, true).unwrap();
+        let start: u64 = 1;
+        let count: u64 = 5;
+        let mut sub = make_memory(count as usize);
+        let ok = db.load_all_pages(&mut sub, start, count, 10, 2).unwrap();
+        assert!(ok);
+        for i in 0..count as usize {
+            let pa = start as usize + i;
+            assert_eq!(
+                get_page(&sub, i),
+                expected[pa],
+                "subrange: pa={pa}"
+            );
+        }
+    }
 }

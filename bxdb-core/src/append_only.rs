@@ -4,10 +4,9 @@ use std::io::{self, BufReader, BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use libc;
 #[cfg(feature = "timing")]
 use std::sync::atomic::AtomicU64;
-#[cfg(feature = "timing")]
-use libc;
 
 #[cfg(feature = "timing")]
 static TIME_COMPRESS_NS: AtomicU64 = AtomicU64::new(0);
@@ -441,6 +440,22 @@ impl AppendOnlyDb {
                 "output length != total_page_count * 4096",
             ));
         }
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize };
+        if !(out.as_ptr() as usize).is_multiple_of(page_size) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "output buffer address not page-aligned",
+            ));
+        }
+        if !out.is_empty() {
+            unsafe {
+                libc::madvise(
+                    out.as_mut_ptr() as *mut libc::c_void,
+                    out.len(),
+                    libc::MADV_DONTNEED,
+                );
+            }
+        }
         let worker_count = worker_count.max(1);
 
         // A bulk load resolves each PA exactly once, so there is no reuse to
@@ -506,7 +521,6 @@ fn load_all_btree(
                     match store.floor(pa, snapshot_id)? {
                         Some(rec) => store.resolve_uncached(&rec, slot_arr)?,
                         None => {
-                            slot_arr.fill(0);
                             success_ref.store(false, Ordering::Relaxed);
                         }
                     }
@@ -583,7 +597,6 @@ fn load_all_scan(
                     match &latest[start_idx + i] {
                         Some(rec) => store.resolve_uncached(rec, slot_arr)?,
                         None => {
-                            slot_arr.fill(0);
                             success_ref.store(false, Ordering::Relaxed);
                         }
                     }
