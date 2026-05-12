@@ -1,12 +1,12 @@
+use libc;
 use std::cell::RefCell;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use libc;
 #[cfg(feature = "timing")]
 use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[cfg(feature = "timing")]
 static TIME_COMPRESS_NS: AtomicU64 = AtomicU64::new(0);
@@ -14,6 +14,8 @@ static TIME_COMPRESS_NS: AtomicU64 = AtomicU64::new(0);
 static TIME_BLOB_WRITE_NS: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "timing")]
 static TIME_SHADOW_NS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "timing")]
+const TIMING_CSV_HEADER: &str = "snapshot_id,total_pages,total_dirty,pass2_s,compress_s,blob_write_s,shadow_s,log_write_s,log_sync_s,blob_sync_wall_s,blob_sync_cpu_s,blob_sync_cpu_pct";
 
 thread_local! {
     // One reusable zstd context per rayon worker thread — avoids allocating and
@@ -27,12 +29,12 @@ use parking_lot::{Mutex, RwLock};
 use rayon::ThreadPool;
 use rustc_hash::FxHashMap;
 
+use crate::btree::{IndexMode, PageStore};
 use crate::chunk::{
     ChunkRecord, DEFAULT_DELTA_THRESHOLD, MAGIC_LOG, MAX_SNAPSHOT_ID, PAGE_SIZE, compute_xor_patch,
     encode_delta_patch, encode_key, is_all_zero, pa_of, snapshot_of,
 };
 use crate::format::{read_and_verify_header, write_log_header};
-use crate::btree::{IndexMode, PageStore};
 
 const SHADOW_SHARDS: usize = 2048;
 const SHADOW_SHARDS_MASK: u64 = (SHADOW_SHARDS as u64) - 1;
@@ -100,6 +102,8 @@ pub struct AppendOnlyDb {
     offsets_buf: Vec<u32>,
     // Tracks the last snapshot_id written; enforces monotonic growth.
     last_snapshot: Option<u32>,
+    #[cfg(feature = "timing")]
+    timing_csv: Mutex<Option<std::fs::File>>,
 }
 
 struct BlobFile {
@@ -184,6 +188,21 @@ impl AppendOnlyDb {
             .build()
             .map_err(io::Error::other)?;
 
+        #[cfg(feature = "timing")]
+        let timing_csv = {
+            let csv_path = dir.join("checkpoint_saving_timing.csv");
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&csv_path)?;
+            if file.metadata()?.len() == 0 {
+                use std::io::Write;
+                let mut f = &file;
+                writeln!(f, "{}", TIMING_CSV_HEADER)?;
+            }
+            Mutex::new(Some(file))
+        };
+
         Ok(Self {
             dir,
             delta_threshold: threshold,
@@ -195,6 +214,8 @@ impl AppendOnlyDb {
             records_buf: Vec::new(),
             offsets_buf: Vec::new(),
             last_snapshot: None,
+            #[cfg(feature = "timing")]
+            timing_csv,
         })
     }
 
@@ -354,10 +375,22 @@ impl AppendOnlyDb {
         })?;
         #[cfg(feature = "timing")]
         {
-            eprintln!("[TIMING] pass2 (compress+blob_write): {:.3}s", t_pass2.elapsed().as_secs_f64());
-            eprintln!("[TIMING]   compress:    {:.3}s", TIME_COMPRESS_NS.load(Ordering::Relaxed) as f64 / 1e9);
-            eprintln!("[TIMING]   blob_write:  {:.3}s", TIME_BLOB_WRITE_NS.load(Ordering::Relaxed) as f64 / 1e9);
-            eprintln!("[TIMING]   shadow_ops:  {:.3}s", TIME_SHADOW_NS.load(Ordering::Relaxed) as f64 / 1e9);
+            eprintln!(
+                "[TIMING] pass2 (compress+blob_write): {:.3}s",
+                t_pass2.elapsed().as_secs_f64()
+            );
+            eprintln!(
+                "[TIMING]   compress:    {:.3}s",
+                TIME_COMPRESS_NS.load(Ordering::Relaxed) as f64 / 1e9
+            );
+            eprintln!(
+                "[TIMING]   blob_write:  {:.3}s",
+                TIME_BLOB_WRITE_NS.load(Ordering::Relaxed) as f64 / 1e9
+            );
+            eprintln!(
+                "[TIMING]   shadow_ops:  {:.3}s",
+                TIME_SHADOW_NS.load(Ordering::Relaxed) as f64 / 1e9
+            );
             TIME_COMPRESS_NS.store(0, Ordering::Relaxed);
             TIME_BLOB_WRITE_NS.store(0, Ordering::Relaxed);
             TIME_SHADOW_NS.store(0, Ordering::Relaxed);
@@ -366,9 +399,15 @@ impl AppendOnlyDb {
         // All total_dirty slots have been written exactly once.
         unsafe { self.records_buf.set_len(total_dirty) };
 
+        #[cfg(feature = "timing")]
+        let t_log_write;
+        #[cfg(feature = "timing")]
+        let t_log_sync;
         {
             #[cfg(feature = "timing")]
-            let t_log_write = std::time::Instant::now();
+            {
+                t_log_write = std::time::Instant::now();
+            }
             let mut log = self.log_file.lock();
             {
                 let mut log_buf = BufWriter::with_capacity(1 << 20, &mut *log);
@@ -378,12 +417,21 @@ impl AppendOnlyDb {
                 log_buf.flush()?;
             }
             #[cfg(feature = "timing")]
-            eprintln!("[TIMING] log_write ({} records): {:.3}s", total_dirty, t_log_write.elapsed().as_secs_f64());
+            eprintln!(
+                "[TIMING] log_write ({} records): {:.3}s",
+                total_dirty,
+                t_log_write.elapsed().as_secs_f64()
+            );
             #[cfg(feature = "timing")]
-            let t_log_sync = std::time::Instant::now();
+            {
+                t_log_sync = std::time::Instant::now();
+            }
             log.sync_all()?;
             #[cfg(feature = "timing")]
-            eprintln!("[TIMING] log_sync_all: {:.3}s", t_log_sync.elapsed().as_secs_f64());
+            eprintln!(
+                "[TIMING] log_sync_all: {:.3}s",
+                t_log_sync.elapsed().as_secs_f64()
+            );
         }
         #[cfg(feature = "timing")]
         let t_blob_sync = std::time::Instant::now();
@@ -399,7 +447,10 @@ impl AppendOnlyDb {
                     let (i, t) = (_i, std::time::Instant::now());
                     bf.lock().file.sync_all()?;
                     #[cfg(feature = "timing")]
-                    eprintln!("[TIMING] blob_sync_all[{i}]: {:.3}s", t.elapsed().as_secs_f64());
+                    eprintln!(
+                        "[TIMING] blob_sync_all[{i}]: {:.3}s",
+                        t.elapsed().as_secs_f64()
+                    );
                     Ok::<_, io::Error>(())
                 })
                 .collect::<io::Result<Vec<_>>>()?;
@@ -408,7 +459,32 @@ impl AppendOnlyDb {
         {
             let wall_s = t_blob_sync.elapsed().as_secs_f64();
             let cpu_s = (process_cpu_ns() - cpu_ns_before) as f64 / 1e9;
-            eprintln!("[TIMING] all_blob_syncs total: {wall_s:.3}s  cpu: {cpu_s:.3}s  ({:.1}% CPU)", cpu_s / wall_s * 100.0);
+            let cpu_pct = cpu_s / wall_s * 100.0;
+            eprintln!(
+                "[TIMING] all_blob_syncs total: {wall_s:.3}s  cpu: {cpu_s:.3}s  ({:.1}% CPU)",
+                cpu_pct
+            );
+
+            // Write a single CSV row for this save_pages call.
+            if let Some(ref mut csv_file) = *self.timing_csv.lock() {
+                use std::io::Write;
+                let _ = writeln!(
+                    csv_file,
+                    "{},{},{},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.1}",
+                    snapshot_id,
+                    total_page_count,
+                    total_dirty,
+                    t_pass2.elapsed().as_secs_f64(),
+                    TIME_COMPRESS_NS.load(Ordering::Relaxed) as f64 / 1e9,
+                    TIME_BLOB_WRITE_NS.load(Ordering::Relaxed) as f64 / 1e9,
+                    TIME_SHADOW_NS.load(Ordering::Relaxed) as f64 / 1e9,
+                    t_log_write.elapsed().as_secs_f64(),
+                    t_log_sync.elapsed().as_secs_f64(),
+                    wall_s,
+                    cpu_s,
+                    cpu_pct,
+                );
+            }
         }
         // Update max_snapshot_id in the on-disk header.
         {
@@ -463,9 +539,14 @@ impl AppendOnlyDb {
         let store = PageStore::open(&self.dir)?;
 
         match store.mode() {
-            IndexMode::BTree => {
-                load_all_btree(&store, out, pa_offset, total_page_count, snapshot_id, worker_count)
-            }
+            IndexMode::BTree => load_all_btree(
+                &store,
+                out,
+                pa_offset,
+                total_page_count,
+                snapshot_id,
+                worker_count,
+            ),
             IndexMode::AppendOnly => {
                 let log_path = store
                     .log_path()
@@ -529,7 +610,8 @@ fn load_all_btree(
             }));
         }
         for h in handles {
-            h.join().map_err(|_| io::Error::other("worker panicked"))??;
+            h.join()
+                .map_err(|_| io::Error::other("worker panicked"))??;
         }
         Ok(())
     })?;
@@ -605,7 +687,8 @@ fn load_all_scan(
             }));
         }
         for h in handles {
-            h.join().map_err(|_| io::Error::other("worker panicked"))??;
+            h.join()
+                .map_err(|_| io::Error::other("worker panicked"))??;
         }
         Ok(())
     })?;
@@ -680,7 +763,10 @@ fn process_one(
 
 #[cfg(feature = "timing")]
 fn process_cpu_ns() -> u64 {
-    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
     unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, &mut ts) };
     ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
 }

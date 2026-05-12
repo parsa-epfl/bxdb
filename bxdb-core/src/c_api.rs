@@ -3,10 +3,10 @@ use std::path::Path;
 use std::ptr;
 use std::slice;
 
-use crate::cache;
-use crate::chunk::PAGE_SIZE;
 use crate::append_only::AppendOnlyDb;
 use crate::btree::{self, BtreeDb};
+use crate::cache;
+use crate::chunk::PAGE_SIZE;
 
 pub enum BxdbHandle {
     Dummy,
