@@ -30,7 +30,7 @@ pub fn main() !void {
     var snapshot_id: u32 = 0;
 
     // We first create this checkpoint.
-    bxdb.bxdb_save_pages(db, memory.ptr, @ptrCast(&dirty_bitmap), 64, snapshot_id);
+    bxdb.bxdb_save_all_pages(db, memory.ptr, 64, snapshot_id);
     snapshot_id += 1;
 
     // Then, we update the page and save a second version.
@@ -42,13 +42,13 @@ pub fn main() !void {
     // only the first two pages are changed.
     dirty_bitmap = 0x7;
 
-    bxdb.bxdb_save_pages(db, memory.ptr, @ptrCast(&dirty_bitmap), 64, snapshot_id);
+    bxdb.bxdb_save_pages_with_bitmap(db, memory.ptr, @ptrCast(&dirty_bitmap), 64, snapshot_id);
     snapshot_id += 1;
 
     // For the second snapshot, I would like to create a delta.
     memory[1] = 100;
     dirty_bitmap = 1;
-    bxdb.bxdb_save_pages(db, memory.ptr, @ptrCast(&dirty_bitmap), 64, snapshot_id);
+    bxdb.bxdb_save_pages_with_bitmap(db, memory.ptr, @ptrCast(&dirty_bitmap), 64, snapshot_id);
     snapshot_id += 1;
 
     // For the third snapshot, I would like to create a big delta.
@@ -57,13 +57,13 @@ pub fn main() !void {
     }
 
     dirty_bitmap = 1;
-    bxdb.bxdb_save_pages(db, memory.ptr, @ptrCast(&dirty_bitmap), 64, snapshot_id);
+    bxdb.bxdb_save_pages_with_bitmap(db, memory.ptr, @ptrCast(&dirty_bitmap), 64, snapshot_id);
     snapshot_id += 1;
 
     // Then, we have another delta.
     memory[32] = 70;
 
     dirty_bitmap = 1;
-    bxdb.bxdb_save_pages(db, memory.ptr, @ptrCast(&dirty_bitmap), 64, snapshot_id);
+    bxdb.bxdb_save_pages_with_bitmap(db, memory.ptr, @ptrCast(&dirty_bitmap), 64, snapshot_id);
     snapshot_id += 1;
 }

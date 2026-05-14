@@ -11,6 +11,14 @@ crate-type = ["rlib", "cdylib", "staticlib"]
 name = "compress-bench"
 path = "src/bin/compress_bench.rs"
 
+[[bin]]
+name = "compress-compare"
+path = "src/bin/compress_compare.rs"
+
+[[bin]]
+name = "replay-bench"
+path = "src/bin/replay_bench.rs"
+
 [features]
 default = []
 timing = []

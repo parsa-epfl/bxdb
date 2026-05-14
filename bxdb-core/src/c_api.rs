@@ -63,7 +63,27 @@ pub unsafe extern "C" fn bxdb_close(db: *mut BxdbHandle) {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn bxdb_save_pages(
+pub unsafe extern "C" fn bxdb_save_all_pages(
+    db: *mut BxdbHandle,
+    memory: *const c_char,
+    total_page_count: u64,
+    snapshot_id: u32,
+) {
+    if db.is_null() || memory.is_null() {
+        return;
+    }
+    let handle = unsafe { &mut *db };
+    let append_db = match handle {
+        BxdbHandle::AppendOnly(w) => w,
+        _ => return,
+    };
+    let mem_len = (total_page_count as usize).saturating_mul(PAGE_SIZE);
+    let mem = unsafe { slice::from_raw_parts(memory as *const u8, mem_len) };
+    let _ = append_db.save_all_pages(mem, total_page_count, snapshot_id);
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bxdb_save_pages_with_bitmap(
     db: *mut BxdbHandle,
     memory: *const c_char,
     dirty_bitmap: *const u64,
@@ -82,7 +102,7 @@ pub unsafe extern "C" fn bxdb_save_pages(
     let mem = unsafe { slice::from_raw_parts(memory as *const u8, mem_len) };
     let bitmap_words = ((total_page_count + 63) / 64) as usize;
     let bitmap = unsafe { slice::from_raw_parts(dirty_bitmap, bitmap_words) };
-    let _ = append_db.save_pages(mem, bitmap, total_page_count, snapshot_id);
+    let _ = append_db.save_pages_with_bitmap(mem, bitmap, total_page_count, snapshot_id);
 }
 
 #[unsafe(no_mangle)]

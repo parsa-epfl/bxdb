@@ -4,24 +4,30 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-#[cfg(feature = "timing")]
-use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-#[cfg(feature = "timing")]
-static TIME_COMPRESS_NS: AtomicU64 = AtomicU64::new(0);
-#[cfg(feature = "timing")]
-static TIME_BLOB_WRITE_NS: AtomicU64 = AtomicU64::new(0);
-#[cfg(feature = "timing")]
-static TIME_SHADOW_NS: AtomicU64 = AtomicU64::new(0);
-#[cfg(feature = "timing")]
-const TIMING_CSV_HEADER: &str = "snapshot_id,total_pages,total_dirty,pass2_s,compress_s,blob_write_s,shadow_s,log_write_s,log_sync_s,blob_sync_wall_s,blob_sync_cpu_s,blob_sync_cpu_pct";
-
 thread_local! {
-    // One reusable zstd context per rayon worker thread — avoids allocating and
-    // zeroing a ~1.5 MB hash table on every process_one call.
+    // Per-thread zstd context tuned for 4 KB pages:
+    //   Level 1:  strategy=fast (no lazy matching — wasted on 4 KB)
+    //   WindowLog=12:  4 KB search window (exact page size)
+    //   HashLog=12:    4096 hash buckets (~1 per byte position)
+    //   ChainLog=10:   1024 chain slots (no collisions on 4 KB)
+    //   SearchLog=0:   take first match (no alternatives to check)
+    // This shrinks the context from ~2 MB (default zstd-3) to ~30 KB.
     static ZSTD_CTX: RefCell<zstd::bulk::Compressor<'static>> =
-        RefCell::new(zstd::bulk::Compressor::new(3).expect("zstd init"));
+        RefCell::new({
+            let mut c = zstd::bulk::Compressor::new(1).expect("zstd init");
+            c.set_parameter(zstd::zstd_safe::CParameter::WindowLog(12)).expect("wl");
+            c.set_parameter(zstd::zstd_safe::CParameter::HashLog(12)).expect("hl");
+            c.set_parameter(zstd::zstd_safe::CParameter::ChainLog(10)).expect("cl");
+            c.set_parameter(zstd::zstd_safe::CParameter::SearchLog(0)).expect("sl");
+            c
+        });
+
+    // Reusable output buffer — avoids a Vec allocation per page.
+    // 8 KB is more than enough for any 4 KB input.
+    static COMPRESS_BUF: RefCell<Vec<u8>> =
+        RefCell::new(Vec::with_capacity(8192));
 }
 use std::thread;
 
@@ -45,16 +51,18 @@ const FIB_MUL: u64 = 0x9e3779b97f4a7c15;
 // work stealer to balance dense vs sparse regions; large enough that per-task
 // overhead is negligible next to zstd.
 const WORDS_PER_GROUP: usize = 64;
+const PAGES_PER_GROUP: usize = WORDS_PER_GROUP * 64; // 4096
 
 type ShadowEntry = (u64, Arc<[u8; PAGE_SIZE]>);
 type ShadowShard = RwLock<FxHashMap<u64, ShadowEntry>>;
 
-struct Shadow {
+#[doc(hidden)]
+pub struct Shadow {
     shards: Box<[ShadowShard]>,
 }
 
 impl Shadow {
-    fn new() -> Self {
+    pub fn new() -> Self {
         let v: Vec<ShadowShard> = (0..SHADOW_SHARDS)
             .map(|_| RwLock::new(FxHashMap::default()))
             .collect();
@@ -69,14 +77,14 @@ impl Shadow {
         &self.shards[idx]
     }
 
-    fn get(&self, pa: u64) -> Option<ShadowEntry> {
+    pub fn get(&self, pa: u64) -> Option<ShadowEntry> {
         self.shard(pa)
             .read()
             .get(&pa)
             .map(|(k, p)| (*k, Arc::clone(p)))
     }
 
-    fn insert_if_newer(&self, pa: u64, key: u64, page: Arc<[u8; PAGE_SIZE]>) {
+    pub fn insert_if_newer(&self, pa: u64, key: u64, page: Arc<[u8; PAGE_SIZE]>) {
         let mut w = self.shard(pa).write();
         let install = match w.get(&pa) {
             None => true,
@@ -93,22 +101,22 @@ pub struct AppendOnlyDb {
     delta_threshold: u16,
     use_shadow: bool,
     shadow: Shadow,
-    log_file: Mutex<File>,
+    log_file: BufWriter<File>,
     blob_files: Vec<Mutex<BlobFile>>,
     pool: ThreadPool,
     // Reusable scratch buffers, sized once and kept across save_pages calls.
     records_buf: Vec<ChunkRecord>,
     // Exclusive prefix-sum of per-group dirty counts; len = num_groups + 1.
     offsets_buf: Vec<u32>,
+    // Group indices (u32) of non-empty bitmap groups; built during pass 1b.
+    active_groups: Vec<u32>,
     // Tracks the last snapshot_id written; enforces monotonic growth.
     last_snapshot: Option<u32>,
-    #[cfg(feature = "timing")]
-    timing_csv: Mutex<Option<std::fs::File>>,
 }
 
-struct BlobFile {
-    file: File,
-    offset: u64,
+pub struct BlobFile {
+    pub writer: BufWriter<File>,
+    pub offset: u64,
 }
 
 // Raw pointer wrapper so rayon tasks can write to disjoint indices of
@@ -167,6 +175,7 @@ impl AppendOnlyDb {
             read_and_verify_header(&mut log_file, &MAGIC_LOG)?;
             log_file.seek(SeekFrom::End(0))?;
         }
+        let log_file = BufWriter::with_capacity(1 << 20, log_file);
 
         let mut blob_files = Vec::with_capacity(worker_count);
         for i in 0..worker_count {
@@ -174,11 +183,13 @@ impl AppendOnlyDb {
             let file = OpenOptions::new()
                 .create(true)
                 .read(true)
-                .write(true)
+                .append(true)
                 .open(&path)?;
             let offset = file.metadata()?.len();
-            let mut bf = BlobFile { file, offset };
-            bf.file.seek(SeekFrom::End(0))?;
+            let bf = BlobFile {
+                writer: BufWriter::new(file),
+                offset,
+            };
             blob_files.push(Mutex::new(bf));
         }
 
@@ -188,34 +199,18 @@ impl AppendOnlyDb {
             .build()
             .map_err(io::Error::other)?;
 
-        #[cfg(feature = "timing")]
-        let timing_csv = {
-            let csv_path = dir.join("checkpoint_saving_timing.csv");
-            let file = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&csv_path)?;
-            if file.metadata()?.len() == 0 {
-                use std::io::Write;
-                let mut f = &file;
-                writeln!(f, "{}", TIMING_CSV_HEADER)?;
-            }
-            Mutex::new(Some(file))
-        };
-
         Ok(Self {
             dir,
             delta_threshold: threshold,
             use_shadow,
             shadow: Shadow::new(),
-            log_file: Mutex::new(log_file),
+            log_file,
             blob_files,
             pool,
             records_buf: Vec::new(),
             offsets_buf: Vec::new(),
+            active_groups: Vec::with_capacity(8192),
             last_snapshot: None,
-            #[cfg(feature = "timing")]
-            timing_csv,
         })
     }
 
@@ -223,7 +218,106 @@ impl AppendOnlyDb {
         &self.dir
     }
 
-    pub fn save_pages(
+    pub fn save_all_pages(
+        &mut self,
+        memory: &[u8],
+        total_page_count: u64,
+        snapshot_id: u32,
+    ) -> io::Result<()> {
+        if snapshot_id > MAX_SNAPSHOT_ID {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "snapshot_id exceeds 19-bit range",
+            ));
+        }
+        if let Some(last) = self.last_snapshot {
+            if snapshot_id <= last {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "snapshot_id must increase monotonically: got {snapshot_id} after {last}"
+                    ),
+                ));
+            }
+        }
+        self.last_snapshot = Some(snapshot_id);
+        let total = total_page_count as usize;
+        let expected_mem = (total as u128) * (PAGE_SIZE as u128);
+        if memory.len() as u128 != expected_mem {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "memory length != total_page_count * 4096",
+            ));
+        }
+        if total == 0 {
+            return Ok(());
+        }
+
+        let num_groups = (total + PAGES_PER_GROUP - 1) / PAGES_PER_GROUP;
+
+        self.records_buf.clear();
+        self.records_buf.reserve(total);
+        let buf_ptr = RecordsPtr {
+            ptr: self.records_buf.as_mut_ptr(),
+            len: total,
+        };
+
+        let shadow = &self.shadow;
+        let blob_files = &self.blob_files;
+        let threshold = self.delta_threshold as usize;
+        let blob_count = blob_files.len();
+        let use_shadow = self.use_shadow;
+
+        self.pool.install(|| -> io::Result<()> {
+            use rayon::prelude::*;
+            (0..num_groups)
+                .into_par_iter()
+                .try_for_each(|group_idx| -> io::Result<()> {
+                    let write_base = group_idx * PAGES_PER_GROUP;
+                    let group_pa = (group_idx * PAGES_PER_GROUP) as u64;
+                    let group_pages = if group_idx + 1 == num_groups {
+                        total - write_base
+                    } else {
+                        PAGES_PER_GROUP
+                    };
+
+                    for i in 0..group_pages {
+                        let pa = group_pa + i as u64;
+                        let mem_off = (pa as usize) * PAGE_SIZE;
+                        let page: &[u8; PAGE_SIZE] =
+                            memory[mem_off..mem_off + PAGE_SIZE].try_into().unwrap();
+                        let wid = (pa as usize) % blob_count;
+                        let rec = process_one(
+                            pa,
+                            page,
+                            snapshot_id,
+                            wid as u8,
+                            shadow,
+                            &blob_files[wid],
+                            threshold,
+                            use_shadow,
+                        )?;
+                        unsafe { buf_ptr.write(write_base + i, rec) };
+                    }
+                    Ok(())
+                })
+        })?;
+
+        unsafe { self.records_buf.set_len(total) };
+
+        for r in &self.records_buf {
+            r.write_to(&mut self.log_file)?;
+        }
+
+        {
+            self.log_file.seek(SeekFrom::Start(9))?;
+            self.log_file.write_all(&snapshot_id.to_le_bytes())?;
+            self.log_file.seek(SeekFrom::End(0))?;
+        }
+        Ok(())
+    }
+
+    pub fn save_pages_with_bitmap(
         &mut self,
         memory: &[u8],
         dirty_bitmap: &[u64],
@@ -298,8 +392,12 @@ impl AppendOnlyDb {
         }
 
         let mut acc: u32 = 0;
-        for slot in self.offsets_buf[..num_groups].iter_mut() {
+        self.active_groups.clear();
+        for (g, slot) in self.offsets_buf[..num_groups].iter_mut().enumerate() {
             let c = *slot;
+            if c > 0 {
+                self.active_groups.push(g as u32);
+            }
             *slot = acc;
             acc = acc.checked_add(c).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidInput, "dirty count exceeds u32")
@@ -324,23 +422,23 @@ impl AppendOnlyDb {
         };
 
         let offsets = &self.offsets_buf;
+        let active = &self.active_groups;
         let shadow = &self.shadow;
         let blob_files = &self.blob_files;
         let threshold = self.delta_threshold as usize;
         let blob_count = blob_files.len();
         let use_shadow = self.use_shadow;
 
-        #[cfg(feature = "timing")]
-        let t_pass2 = std::time::Instant::now();
         self.pool.install(|| -> io::Result<()> {
             use rayon::prelude::*;
-            (0..num_groups)
-                .into_par_iter()
-                .try_for_each(|group_idx| -> io::Result<()> {
-                    let mut write_idx = offsets[group_idx] as usize;
-                    let group_end = offsets[group_idx + 1] as usize;
-                    let start = group_idx * WORDS_PER_GROUP;
-                    let end = ((group_idx + 1) * WORDS_PER_GROUP).min(expected_words);
+            active
+                .par_iter()
+                .try_for_each(|&group_idx| -> io::Result<()> {
+                    let g = group_idx as usize;
+                    let mut write_idx = offsets[g] as usize;
+                    let group_end = offsets[g + 1] as usize;
+                    let start = g * WORDS_PER_GROUP;
+                    let end = ((g + 1) * WORDS_PER_GROUP).min(expected_words);
 
                     for wi in start..end {
                         let mut w =
@@ -373,125 +471,19 @@ impl AppendOnlyDb {
                     Ok(())
                 })
         })?;
-        #[cfg(feature = "timing")]
-        {
-            eprintln!(
-                "[TIMING] pass2 (compress+blob_write): {:.3}s",
-                t_pass2.elapsed().as_secs_f64()
-            );
-            eprintln!(
-                "[TIMING]   compress:    {:.3}s",
-                TIME_COMPRESS_NS.load(Ordering::Relaxed) as f64 / 1e9
-            );
-            eprintln!(
-                "[TIMING]   blob_write:  {:.3}s",
-                TIME_BLOB_WRITE_NS.load(Ordering::Relaxed) as f64 / 1e9
-            );
-            eprintln!(
-                "[TIMING]   shadow_ops:  {:.3}s",
-                TIME_SHADOW_NS.load(Ordering::Relaxed) as f64 / 1e9
-            );
-            TIME_COMPRESS_NS.store(0, Ordering::Relaxed);
-            TIME_BLOB_WRITE_NS.store(0, Ordering::Relaxed);
-            TIME_SHADOW_NS.store(0, Ordering::Relaxed);
-        }
 
         // All total_dirty slots have been written exactly once.
         unsafe { self.records_buf.set_len(total_dirty) };
 
-        #[cfg(feature = "timing")]
-        let t_log_write;
-        #[cfg(feature = "timing")]
-        let t_log_sync;
-        {
-            #[cfg(feature = "timing")]
-            {
-                t_log_write = std::time::Instant::now();
-            }
-            let mut log = self.log_file.lock();
-            {
-                let mut log_buf = BufWriter::with_capacity(1 << 20, &mut *log);
-                for r in &self.records_buf {
-                    r.write_to(&mut log_buf)?;
-                }
-                log_buf.flush()?;
-            }
-            #[cfg(feature = "timing")]
-            eprintln!(
-                "[TIMING] log_write ({} records): {:.3}s",
-                total_dirty,
-                t_log_write.elapsed().as_secs_f64()
-            );
-            #[cfg(feature = "timing")]
-            {
-                t_log_sync = std::time::Instant::now();
-            }
-            log.sync_all()?;
-            #[cfg(feature = "timing")]
-            eprintln!(
-                "[TIMING] log_sync_all: {:.3}s",
-                t_log_sync.elapsed().as_secs_f64()
-            );
+        for r in &self.records_buf {
+            r.write_to(&mut self.log_file)?;
         }
-        #[cfg(feature = "timing")]
-        let t_blob_sync = std::time::Instant::now();
-        #[cfg(feature = "timing")]
-        let cpu_ns_before = process_cpu_ns();
-        {
-            use rayon::prelude::*;
-            self.blob_files
-                .par_iter()
-                .enumerate()
-                .map(|(_i, bf): (usize, _)| {
-                    #[cfg(feature = "timing")]
-                    let (i, t) = (_i, std::time::Instant::now());
-                    bf.lock().file.sync_all()?;
-                    #[cfg(feature = "timing")]
-                    eprintln!(
-                        "[TIMING] blob_sync_all[{i}]: {:.3}s",
-                        t.elapsed().as_secs_f64()
-                    );
-                    Ok::<_, io::Error>(())
-                })
-                .collect::<io::Result<Vec<_>>>()?;
-        }
-        #[cfg(feature = "timing")]
-        {
-            let wall_s = t_blob_sync.elapsed().as_secs_f64();
-            let cpu_s = (process_cpu_ns() - cpu_ns_before) as f64 / 1e9;
-            let cpu_pct = cpu_s / wall_s * 100.0;
-            eprintln!(
-                "[TIMING] all_blob_syncs total: {wall_s:.3}s  cpu: {cpu_s:.3}s  ({:.1}% CPU)",
-                cpu_pct
-            );
 
-            // Write a single CSV row for this save_pages call.
-            if let Some(ref mut csv_file) = *self.timing_csv.lock() {
-                use std::io::Write;
-                let _ = writeln!(
-                    csv_file,
-                    "{},{},{},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.1}",
-                    snapshot_id,
-                    total_page_count,
-                    total_dirty,
-                    t_pass2.elapsed().as_secs_f64(),
-                    TIME_COMPRESS_NS.load(Ordering::Relaxed) as f64 / 1e9,
-                    TIME_BLOB_WRITE_NS.load(Ordering::Relaxed) as f64 / 1e9,
-                    TIME_SHADOW_NS.load(Ordering::Relaxed) as f64 / 1e9,
-                    t_log_write.elapsed().as_secs_f64(),
-                    t_log_sync.elapsed().as_secs_f64(),
-                    wall_s,
-                    cpu_s,
-                    cpu_pct,
-                );
-            }
-        }
         // Update max_snapshot_id in the on-disk header.
         {
-            let mut log = self.log_file.lock();
-            log.seek(SeekFrom::Start(9))?;
-            log.write_all(&snapshot_id.to_le_bytes())?;
-            log.seek(SeekFrom::End(0))?;
+            self.log_file.seek(SeekFrom::Start(9))?;
+            self.log_file.write_all(&snapshot_id.to_le_bytes())?;
+            self.log_file.seek(SeekFrom::End(0))?;
         }
         Ok(())
     }
@@ -707,7 +699,7 @@ fn mask_last_word(w: u64, wi: usize, expected_words: usize, total_page_count: u6
     w
 }
 
-fn process_one(
+pub fn process_one(
     pa: u64,
     page: &[u8; PAGE_SIZE],
     snapshot_id: u32,
@@ -736,45 +728,27 @@ fn process_one(
         }
     }
 
-    #[cfg(feature = "timing")]
-    let t0 = std::time::Instant::now();
-    let compressed = ZSTD_CTX.with(|c| c.borrow_mut().compress(&page[..]))?;
-    #[cfg(feature = "timing")]
-    TIME_COMPRESS_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
-
-    #[cfg(feature = "timing")]
-    let t1 = std::time::Instant::now();
-    let (offset, len) = append_blob(blob, &compressed)?;
-    #[cfg(feature = "timing")]
-    TIME_BLOB_WRITE_NS.fetch_add(t1.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    let (offset, len) = COMPRESS_BUF.with(|buf_cell| {
+        let mut buf = buf_cell.borrow_mut();
+        buf.clear();
+        ZSTD_CTX.with(|c| c.borrow_mut().compress_to_buffer(&page[..], &mut *buf))?;
+        let result = append_blob(blob, &buf)?;
+        Ok::<_, io::Error>(result)
+    })?;
 
     let rec = ChunkRecord::new_full(key, worker_id, offset, len);
 
     if use_shadow {
-        #[cfg(feature = "timing")]
-        let t2 = std::time::Instant::now();
         shadow.insert_if_newer(pa, key, Arc::new(*page));
-        #[cfg(feature = "timing")]
-        TIME_SHADOW_NS.fetch_add(t2.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
 
     Ok(rec)
 }
 
-#[cfg(feature = "timing")]
-fn process_cpu_ns() -> u64 {
-    let mut ts = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, &mut ts) };
-    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
-}
-
-fn append_blob(blob: &Mutex<BlobFile>, data: &[u8]) -> io::Result<(u64, u32)> {
+pub fn append_blob(blob: &Mutex<BlobFile>, data: &[u8]) -> io::Result<(u64, u32)> {
     let mut g = blob.lock();
     let offset = g.offset;
-    g.file.write_all(data)?;
+    g.writer.write_all(data)?;
     g.offset += data.len() as u64;
     let len: u32 = data
         .len()

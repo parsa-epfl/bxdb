@@ -25,7 +25,7 @@ fn populate_memory_and_save_db(memory: []u8, db_name: [:0]u8, mv: [][4096 * 3]u8
     defer bxdb.bxdb_close(db);
 
     // save a version.
-    bxdb.bxdb_save_pages(db, memory.ptr, @ptrCast(&dirty_bitmap), 3, snapshot_id);
+    bxdb.bxdb_save_pages_with_bitmap(db, memory.ptr, @ptrCast(&dirty_bitmap), 3, snapshot_id);
     @memcpy(mv[snapshot_id][0..], memory);
     snapshot_id += 1;
 
@@ -36,7 +36,7 @@ fn populate_memory_and_save_db(memory: []u8, db_name: [:0]u8, mv: [][4096 * 3]u8
 
     memory[8192 + 0] = 34;
     dirty_bitmap = 0b101;
-    bxdb.bxdb_save_pages(db, memory.ptr, @ptrCast(&dirty_bitmap), 3, snapshot_id);
+    bxdb.bxdb_save_pages_with_bitmap(db, memory.ptr, @ptrCast(&dirty_bitmap), 3, snapshot_id);
     @memcpy(mv[snapshot_id][0..], memory);
     snapshot_id += 1;
 
@@ -49,7 +49,7 @@ fn populate_memory_and_save_db(memory: []u8, db_name: [:0]u8, mv: [][4096 * 3]u8
     memory[4] = 111;
 
     dirty_bitmap = 0b011;
-    bxdb.bxdb_save_pages(db, memory.ptr, @ptrCast(&dirty_bitmap), 3, snapshot_id);
+    bxdb.bxdb_save_pages_with_bitmap(db, memory.ptr, @ptrCast(&dirty_bitmap), 3, snapshot_id);
     @memcpy(mv[snapshot_id][0..], memory);
     snapshot_id += 1;
 
@@ -60,7 +60,7 @@ fn populate_memory_and_save_db(memory: []u8, db_name: [:0]u8, mv: [][4096 * 3]u8
     memory[5] = 222;
 
     dirty_bitmap = 0b11;
-    bxdb.bxdb_save_pages(db, memory.ptr, @ptrCast(&dirty_bitmap), 3, snapshot_id);
+    bxdb.bxdb_save_pages_with_bitmap(db, memory.ptr, @ptrCast(&dirty_bitmap), 3, snapshot_id);
     @memcpy(mv[snapshot_id][0..], memory);
     snapshot_id += 1;
 }

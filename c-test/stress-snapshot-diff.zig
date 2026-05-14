@@ -142,11 +142,11 @@ pub fn main() !void {
         const db = bxdb.bxdb_open_for_append_only(DB_64W, 64, 256, true) orelse return error.OpenFailed;
         defer bxdb.bxdb_close(db);
 
-        bxdb.bxdb_save_pages(db, src.ptr, snap0_bitmap.ptr, TOTAL_PAGES, 0);
+        bxdb.bxdb_save_pages_with_bitmap(db, src.ptr, snap0_bitmap.ptr, TOTAL_PAGES, 0);
         std.debug.print("Snap0 saved (64w)\n", .{});
 
         const t0 = nanotime();
-        bxdb.bxdb_save_pages(db, snap1_mem.ptr, snap1_bitmap.ptr, TOTAL_PAGES, 1);
+        bxdb.bxdb_save_pages_with_bitmap(db, snap1_mem.ptr, snap1_bitmap.ptr, TOTAL_PAGES, 1);
         const elapsed = nanotime() - t0;
         std.debug.print("Snap1 save 64w: {d} ns ({d:.2} s)\n", .{ elapsed, @as(f64, @floatFromInt(elapsed)) / 1e9 });
     }
@@ -159,11 +159,11 @@ pub fn main() !void {
         const db = bxdb.bxdb_open_for_append_only(DB_1W, 1, 256, true) orelse return error.OpenFailed;
         defer bxdb.bxdb_close(db);
 
-        bxdb.bxdb_save_pages(db, src.ptr, snap0_bitmap.ptr, TOTAL_PAGES, 0);
+        bxdb.bxdb_save_pages_with_bitmap(db, src.ptr, snap0_bitmap.ptr, TOTAL_PAGES, 0);
         std.debug.print("Snap0 saved (1w)\n", .{});
 
         const t0 = nanotime();
-        bxdb.bxdb_save_pages(db, snap1_mem.ptr, snap1_bitmap.ptr, TOTAL_PAGES, 1);
+        bxdb.bxdb_save_pages_with_bitmap(db, snap1_mem.ptr, snap1_bitmap.ptr, TOTAL_PAGES, 1);
         const elapsed = nanotime() - t0;
         std.debug.print("Snap1 save  1w: {d} ns ({d:.2} s)\n", .{ elapsed, @as(f64, @floatFromInt(elapsed)) / 1e9 });
     }

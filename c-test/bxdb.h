@@ -55,11 +55,16 @@ struct BxdbHandle *bxdb_open_for_btree(const char *name);
 
 void bxdb_close(struct BxdbHandle *db);
 
-void bxdb_save_pages(struct BxdbHandle *db,
-                     const char *memory,
-                     const uint64_t *dirty_bitmap,
-                     uint64_t total_page_count,
-                     uint32_t snapshot_id);
+void bxdb_save_all_pages(struct BxdbHandle *db,
+                         const char *memory,
+                         uint64_t total_page_count,
+                         uint32_t snapshot_id);
+
+void bxdb_save_pages_with_bitmap(struct BxdbHandle *db,
+                                 const char *memory,
+                                 const uint64_t *dirty_bitmap,
+                                 uint64_t total_page_count,
+                                 uint32_t snapshot_id);
 
 bool bxdb_load_page(struct BxdbHandle *db, char *page, uint64_t pa, uint32_t snapshot_id);
 

@@ -151,7 +151,7 @@ fn write_read_single_snapshot_btree() {
     }
 
     let mut wdb = AppendOnlyDb::open(&dir, 4, 0, true).unwrap();
-    wdb.save_pages(&memory, &bitmap, n_pages, 7).unwrap();
+    wdb.save_pages_with_bitmap(&memory, &bitmap, n_pages, 7).unwrap();
     drop(wdb);
 
     convert_to_btree(&dir);
@@ -181,7 +181,7 @@ fn zero_pages_and_reads_without_blob_io() {
     }
 
     let mut wdb = AppendOnlyDb::open(&dir, 2, 0, true).unwrap();
-    wdb.save_pages(&memory, &bitmap, n_pages, 1).unwrap();
+    wdb.save_pages_with_bitmap(&memory, &bitmap, n_pages, 1).unwrap();
     drop(wdb);
 
     convert_to_btree(&dir);
@@ -217,7 +217,7 @@ fn delta_chain_floor_query_multiple_snapshots() {
     }
 
     let mut wdb = AppendOnlyDb::open(&dir, 2, 256, true).unwrap();
-    wdb.save_pages(&memory, &bitmap, n_pages, 10).unwrap();
+    wdb.save_pages_with_bitmap(&memory, &bitmap, n_pages, 10).unwrap();
 
     // Snapshot 20: modify a few bytes in each page so xor patch is tiny.
     let mut snapshots_20: Vec<[u8; PAGE_SIZE]> = base.clone();
@@ -226,7 +226,7 @@ fn delta_chain_floor_query_multiple_snapshots() {
         p[i * 2 + 1] ^= 0xCD;
         set_page(&mut memory, i, p);
     }
-    wdb.save_pages(&memory, &bitmap, n_pages, 20).unwrap();
+    wdb.save_pages_with_bitmap(&memory, &bitmap, n_pages, 20).unwrap();
 
     // Snapshot 40: modify further, still small.
     let mut snapshots_40: Vec<[u8; PAGE_SIZE]> = snapshots_20.clone();
@@ -234,7 +234,7 @@ fn delta_chain_floor_query_multiple_snapshots() {
         p[100 + i] ^= 0xEE;
         set_page(&mut memory, i, p);
     }
-    wdb.save_pages(&memory, &bitmap, n_pages, 40).unwrap();
+    wdb.save_pages_with_bitmap(&memory, &bitmap, n_pages, 40).unwrap();
     drop(wdb);
 
     convert_to_btree(&dir);
@@ -276,7 +276,7 @@ fn threshold_forces_new_full_and_reads_stay_correct() {
 
     // Force small threshold so any non-trivial diff produces a new Full.
     let mut wdb = AppendOnlyDb::open(&dir, 1, 4, true).unwrap();
-    wdb.save_pages(&memory, &bitmap, n_pages, 1).unwrap();
+    wdb.save_pages_with_bitmap(&memory, &bitmap, n_pages, 1).unwrap();
 
     // Snapshot 2: change many bytes → exceeds threshold → new Full base.
     let mut snap2 = base.clone();
@@ -286,7 +286,7 @@ fn threshold_forces_new_full_and_reads_stay_correct() {
         }
         set_page(&mut memory, i, p);
     }
-    wdb.save_pages(&memory, &bitmap, n_pages, 2).unwrap();
+    wdb.save_pages_with_bitmap(&memory, &bitmap, n_pages, 2).unwrap();
 
     // Snapshot 3: small tweak → Delta against the new Full base (from snap 2).
     let mut snap3 = snap2.clone();
@@ -295,7 +295,7 @@ fn threshold_forces_new_full_and_reads_stay_correct() {
         p[1] = (i as u8).wrapping_add(9);
         set_page(&mut memory, i, p);
     }
-    wdb.save_pages(&memory, &bitmap, n_pages, 3).unwrap();
+    wdb.save_pages_with_bitmap(&memory, &bitmap, n_pages, 3).unwrap();
     drop(wdb);
 
     convert_to_btree(&dir);
@@ -330,7 +330,7 @@ fn load_all_pages_mixed_kinds() {
     }
 
     let mut wdb = AppendOnlyDb::open(&dir, 3, 128, true).unwrap();
-    wdb.save_pages(&memory, &bitmap, n_pages, 100).unwrap();
+    wdb.save_pages_with_bitmap(&memory, &bitmap, n_pages, 100).unwrap();
 
     // Snapshot 200: only modify half the pages (mix of small delta / new random zeroed).
     let mut bitmap2 = vec![0u64; 1];
@@ -344,7 +344,7 @@ fn load_all_pages_mixed_kinds() {
             set_dirty(&mut bitmap2, i as u64);
         }
     }
-    wdb.save_pages(&memory, &bitmap2, n_pages, 200).unwrap();
+    wdb.save_pages_with_bitmap(&memory, &bitmap2, n_pages, 200).unwrap();
     drop(wdb);
 
     convert_to_btree(&dir);
@@ -388,7 +388,7 @@ fn append_only_scan_mode_read_without_conversion() {
     }
 
     let mut wdb = AppendOnlyDb::open(&dir, 2, 256, true).unwrap();
-    wdb.save_pages(&memory, &bitmap, n_pages, 5).unwrap();
+    wdb.save_pages_with_bitmap(&memory, &bitmap, n_pages, 5).unwrap();
     drop(wdb);
 
     // Do not run convert — read directly from chunks.log.
@@ -417,7 +417,7 @@ fn conversion_is_roundtrippable() {
     }
 
     let mut wdb = AppendOnlyDb::open(&dir, 2, 256, true).unwrap();
-    wdb.save_pages(&memory, &bitmap, n_pages, 42).unwrap();
+    wdb.save_pages_with_bitmap(&memory, &bitmap, n_pages, 42).unwrap();
     drop(wdb);
 
     convert_to_btree(&dir);
@@ -458,7 +458,7 @@ fn bxdb_convert_binary_runs() {
     }
 
     let mut wdb = AppendOnlyDb::open(&dir, 1, 256, true).unwrap();
-    wdb.save_pages(&memory, &bitmap, n_pages, 1).unwrap();
+    wdb.save_pages_with_bitmap(&memory, &bitmap, n_pages, 1).unwrap();
     drop(wdb);
 
     let bin = std::env::current_exe()
@@ -558,7 +558,7 @@ fn readdb_uses_shared_cache_file() {
         set_dirty(&mut bitmap, i as u64);
     }
     let mut wdb = AppendOnlyDb::open(&dir, 1, 256, true).unwrap();
-    wdb.save_pages(&memory, &bitmap, n_pages, 1).unwrap();
+    wdb.save_pages_with_bitmap(&memory, &bitmap, n_pages, 1).unwrap();
     drop(wdb);
     convert_to_btree(&dir);
 
@@ -614,7 +614,7 @@ fn purge_deletes_high_snapshot_records_and_blobs() {
             set_dirty(&mut bitmap, i);
         }
         let mut append_db = AppendOnlyDb::open(&dir, 4, 0, false).unwrap();
-        append_db.save_pages(&memory, &bitmap, n_pages, 1).unwrap();
+        append_db.save_pages_with_bitmap(&memory, &bitmap, n_pages, 1).unwrap();
     }
 
     // Snapshot 2: change page 0.
@@ -624,7 +624,7 @@ fn purge_deletes_high_snapshot_records_and_blobs() {
         set_page(&mut memory, 0, &snap2_page0);
         set_dirty(&mut bitmap, 0);
         let mut append_db = AppendOnlyDb::open(&dir, 4, 0, false).unwrap();
-        append_db.save_pages(&memory, &bitmap, n_pages, 2).unwrap();
+        append_db.save_pages_with_bitmap(&memory, &bitmap, n_pages, 2).unwrap();
     }
 
     // Snapshot 3: change page 0 again.
@@ -634,7 +634,7 @@ fn purge_deletes_high_snapshot_records_and_blobs() {
         set_page(&mut memory, 0, &snap3_page0);
         set_dirty(&mut bitmap, 0);
         let mut append_db = AppendOnlyDb::open(&dir, 4, 0, false).unwrap();
-        append_db.save_pages(&memory, &bitmap, n_pages, 3).unwrap();
+        append_db.save_pages_with_bitmap(&memory, &bitmap, n_pages, 3).unwrap();
     }
 
     convert_to_btree(&dir);
@@ -690,7 +690,7 @@ fn purge_deletes_high_snapshot_from_log_format() {
             set_dirty(&mut bitmap, i);
         }
         let mut append_db = AppendOnlyDb::open(&dir, 4, 0, false).unwrap();
-        append_db.save_pages(&memory, &bitmap, n_pages, 1).unwrap();
+        append_db.save_pages_with_bitmap(&memory, &bitmap, n_pages, 1).unwrap();
     }
 
     // Snapshot 2.
@@ -700,7 +700,7 @@ fn purge_deletes_high_snapshot_from_log_format() {
         set_page(&mut memory, 0, &snap2_page0);
         set_dirty(&mut bitmap, 0);
         let mut append_db = AppendOnlyDb::open(&dir, 4, 0, false).unwrap();
-        append_db.save_pages(&memory, &bitmap, n_pages, 2).unwrap();
+        append_db.save_pages_with_bitmap(&memory, &bitmap, n_pages, 2).unwrap();
     }
 
     // Snapshot 3.
@@ -710,7 +710,7 @@ fn purge_deletes_high_snapshot_from_log_format() {
         set_page(&mut memory, 0, &snap3_page0);
         set_dirty(&mut bitmap, 0);
         let mut append_db = AppendOnlyDb::open(&dir, 4, 0, false).unwrap();
-        append_db.save_pages(&memory, &bitmap, n_pages, 3).unwrap();
+        append_db.save_pages_with_bitmap(&memory, &bitmap, n_pages, 3).unwrap();
     }
 
     // Purge directly from chunks.log (no prior conversion).
@@ -731,7 +731,7 @@ fn purge_deletes_high_snapshot_from_log_format() {
 }
 
 #[test]
-fn save_pages_rejects_non_monotonic_snapshots() {
+fn save_pages_with_bitmap_rejects_non_monotonic_snapshots() {
     let tmp = TempDir::new().unwrap();
     let dir = tmp.path().join("db");
     let n_pages = 16u64;
@@ -744,16 +744,16 @@ fn save_pages_rejects_non_monotonic_snapshots() {
     }
 
     // First save at snap 5 works.
-    append_db.save_pages(&memory, &bitmap, n_pages, 5).unwrap();
+    append_db.save_pages_with_bitmap(&memory, &bitmap, n_pages, 5).unwrap();
 
     // Same snapshot is rejected.
-    assert!(append_db.save_pages(&memory, &bitmap, n_pages, 5).is_err());
+    assert!(append_db.save_pages_with_bitmap(&memory, &bitmap, n_pages, 5).is_err());
 
     // Lower snapshot is rejected.
-    assert!(append_db.save_pages(&memory, &bitmap, n_pages, 4).is_err());
+    assert!(append_db.save_pages_with_bitmap(&memory, &bitmap, n_pages, 4).is_err());
 
     // Higher snapshot still works.
-    append_db.save_pages(&memory, &bitmap, n_pages, 6).unwrap();
+    append_db.save_pages_with_bitmap(&memory, &bitmap, n_pages, 6).unwrap();
 }
 
 #[test]
@@ -781,7 +781,7 @@ fn batch_load_zero_pages_recovered_without_write() {
     }
 
     let mut wdb = AppendOnlyDb::open(&dir, 2, 128, true).unwrap();
-    wdb.save_pages(&memory, &bitmap, n_pages, 10).unwrap();
+    wdb.save_pages_with_bitmap(&memory, &bitmap, n_pages, 10).unwrap();
     drop(wdb);
 
     // --- Scan mode (append-only, no conversion) ---

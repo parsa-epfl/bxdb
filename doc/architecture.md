@@ -27,10 +27,10 @@ the remaining data.
 | Physical address | At most 45 bits |
 | Combined key | 64-bit integer: bits 63..19 = PA, bits 18..0 = snapshot_id |
 | Write latency | Fast; parallelised internally across workers |
-| Durability | `bxdb_save_pages` flushes to disk before returning |
+| Durability | `bxdb_save_pages_with_bitmap` / `bxdb_save_all_pages` flushes to disk before returning |
 | Read latency | Tolerant; targeting milliseconds (compute < 10% of I/O time) |
 | Operations | Create, read, and offline batch delete via `bxdb-purge` |
-| Snapshot ordering | Snapshot IDs must increase monotonically across `save_pages` calls |
+| Snapshot ordering | Snapshot IDs must increase monotonically across `save_pages_with_bitmap` / `save_all_pages` calls |
 | Interface | Compiled shared library with a synchronous C API |
 
 ### Combined Key Encoding
@@ -72,6 +72,17 @@ BxdbHandle *bxdb_open_for_btree(const char *name);
 void bxdb_close(BxdbHandle *db);
 
 /*
+ * Save all pages for a snapshot. Synchronous — blocks until all pages
+ * have been compressed, written to disk, and fsynced.
+ *
+ * Every page is treated as dirty; no bitmap is required.
+ */
+void bxdb_save_all_pages(BxdbHandle      *db,
+                         const char      *memory,
+                         uint64_t         total_page_count,
+                         uint32_t         snapshot_id);
+
+/*
  * Save pages for a snapshot. Synchronous — blocks until all dirty pages
  * have been compressed, written to disk, and fsynced.
  *
@@ -84,11 +95,11 @@ void bxdb_close(BxdbHandle *db);
  * total_page_count - number of pages in memory[]
  * snapshot_id      - must fit in 19 bits
  */
-void bxdb_save_pages(BxdbHandle      *db,
-                     const char      *memory,
-                     const uint64_t  *dirty_bitmap,
-                     uint64_t         total_page_count,
-                     uint32_t         snapshot_id);
+void bxdb_save_pages_with_bitmap(BxdbHandle      *db,
+                                 const char      *memory,
+                                 const uint64_t  *dirty_bitmap,
+                                 uint64_t         total_page_count,
+                                 uint32_t         snapshot_id);
 
 /*
  * Load a single page. Synchronous. Requires a btree-mode handle.
@@ -181,16 +192,16 @@ content. If zero, a `Zero` chunk is recorded with no blob data.
 
 ### Caller View
 
-`bxdb_save_pages` is fully synchronous. The caller passes the snapshot memory
+`bxdb_save_pages_with_bitmap` is fully synchronous. The caller passes the snapshot memory
 and dirty bitmap, and the function returns only after all dirty pages are
 durable on disk.
 
-**Monotonic snapshot constraint.** Each `save_pages` call on a handle must use a
+**Monotonic snapshot constraint.** Each `save_pages_with_bitmap` / `save_all_pages` call on a handle must use a
 snapshot ID strictly greater than the previous call's value. The library enforces
 this and returns an error on violations. This guarantee means:
 
 - Records in `chunks.log` appear in increasing snapshot order (within each
-  `save_pages` batch, every record shares the same snapshot ID; batches
+  `save_pages_with_bitmap` batch, every record shares the same snapshot ID; batches
   themselves are sequential).
 - Blob data within each worker file is laid out in monotonically increasing
   snapshot order — blobs for snapshot N are always at offsets lower than blobs
@@ -202,7 +213,7 @@ deletion (see §8).
 ### Internal Parallelism
 
 Worker threads exist solely to **process dirty pages in parallel** within a
-single `bxdb_save_pages` call. The main thread scans the dirty bitmap
+single `bxdb_save_pages_with_bitmap` call. The main thread scans the dirty bitmap
 sequentially and dispatches each set bit as a job to a shared work queue.
 Worker threads pull jobs from the queue concurrently.
 
@@ -310,7 +321,7 @@ Both file types share the same 16-byte header layout:
 ```
 
 `max_snapshot_id` is the highest snapshot ID among all records in the file.
-For `chunks.log`, it is updated in-place after each successful `save_pages`
+For `chunks.log`, it is updated in-place after each successful `save_pages_with_bitmap`
 call. For `index.bxdb`, it is set during conversion or purge.
 
 ### Append-Only Format (`chunks.log`)
@@ -414,7 +425,7 @@ bxdb-convert to-log <name>
 
 This preserves the monotonic snapshot invariant in the output log — records for
 snapshot N appear before records for snapshot N+1, matching the order produced by
-`save_pages`.
+`save_pages_with_bitmap`.
 
 Both conversions are idempotent.
 

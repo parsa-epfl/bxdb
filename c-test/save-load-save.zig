@@ -29,7 +29,7 @@ pub fn main() !void {
     var snapshot_id: u32 = 0;
 
     // We first create this checkpoint.
-    bxdb.bxdb_save_pages(db, memory.ptr, @ptrCast(&dirty_bitmap), 64, snapshot_id);
+    bxdb.bxdb_save_all_pages(db, memory.ptr, 64, snapshot_id);
     snapshot_id += 1;
 
     // Then, we update the page and save a second version.
@@ -41,13 +41,13 @@ pub fn main() !void {
     // only the first two pages are changed.
     dirty_bitmap = 0x7;
 
-    bxdb.bxdb_save_pages(db, memory.ptr, @ptrCast(&dirty_bitmap), 64, snapshot_id);
+    bxdb.bxdb_save_pages_with_bitmap(db, memory.ptr, @ptrCast(&dirty_bitmap), 64, snapshot_id);
     snapshot_id += 1;
 
     // Let's do a third-time changes, targeting page[2].
     memory[2 * 4096 + 10] = 55;
     dirty_bitmap = 1 << 2;
-    bxdb.bxdb_save_pages(db, memory.ptr, @ptrCast(&dirty_bitmap), 64, snapshot_id);
+    bxdb.bxdb_save_pages_with_bitmap(db, memory.ptr, @ptrCast(&dirty_bitmap), 64, snapshot_id);
     snapshot_id += 1;
 
     // Now, we close this DB.
@@ -59,6 +59,6 @@ pub fn main() !void {
 
     memory[3] = 50;
     dirty_bitmap = 1;
-    bxdb.bxdb_save_pages(db2, memory.ptr, @ptrCast(&dirty_bitmap), 64, snapshot_id);
+    bxdb.bxdb_save_pages_with_bitmap(db2, memory.ptr, @ptrCast(&dirty_bitmap), 64, snapshot_id);
     snapshot_id += 1;
 }

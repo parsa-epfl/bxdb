@@ -4,7 +4,13 @@ pub extern fn bxdb_init() ?*BxdbHandle;
 pub extern fn bxdb_open_for_append_only(name: [*:0]const u8, worker_count: i32, delta_threshold: u16, use_shadow: bool) ?*BxdbHandle;
 pub extern fn bxdb_open_for_btree(name: [*:0]const u8) ?*BxdbHandle;
 pub extern fn bxdb_close(db: ?*BxdbHandle) void;
-pub extern fn bxdb_save_pages(
+pub extern fn bxdb_save_all_pages(
+    db: ?*BxdbHandle,
+    memory: [*]const u8,
+    total_page_count: u64,
+    snapshot_id: u32,
+) void;
+pub extern fn bxdb_save_pages_with_bitmap(
     db: ?*BxdbHandle,
     memory: [*]const u8,
     dirty_bitmap: [*]const u64,

@@ -73,10 +73,6 @@ pub fn main() !void {
         std.debug.print("Reusing existing stress-test-data.raw\n", .{});
     }
 
-    const bitmap = try std.heap.page_allocator.alloc(u64, BITMAP_WORDS);
-    defer std.heap.page_allocator.free(bitmap);
-    @memset(bitmap, 0xFFFF_FFFF_FFFF_FFFF);
-
     const src = try mmapReadOnly();
     defer posix.munmap(src);
 
@@ -97,7 +93,7 @@ pub fn main() !void {
         const db = bxdb.bxdb_open_for_append_only(DB_64W, 64, 256, false) orelse return error.OpenFailed;
         defer bxdb.bxdb_close(db);
         const t0 = nanotime();
-        bxdb.bxdb_save_pages(db, src.ptr, bitmap.ptr, TOTAL_PAGES, 0);
+        bxdb.bxdb_save_all_pages(db, src.ptr, TOTAL_PAGES, 0);
         const elapsed = nanotime() - t0;
         std.debug.print("Save 64w: {d} ns ({d:.2} s)\n", .{ elapsed, @as(f64, @floatFromInt(elapsed)) / 1e9 });
     }
@@ -108,7 +104,7 @@ pub fn main() !void {
         const db = bxdb.bxdb_open_for_append_only(DB_1W, 1, 256, false) orelse return error.OpenFailed;
         defer bxdb.bxdb_close(db);
         const t0 = nanotime();
-        bxdb.bxdb_save_pages(db, src.ptr, bitmap.ptr, TOTAL_PAGES, 0);
+        bxdb.bxdb_save_all_pages(db, src.ptr, TOTAL_PAGES, 0);
         const elapsed = nanotime() - t0;
         std.debug.print("Save  1w: {d} ns ({d:.2} s)\n", .{ elapsed, @as(f64, @floatFromInt(elapsed)) / 1e9 });
     }
