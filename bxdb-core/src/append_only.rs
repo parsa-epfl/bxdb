@@ -168,13 +168,15 @@ impl AppendOnlyDb {
             .write(true)
             .open(&log_path)?;
         let size = log_file.metadata()?.len();
-        if size == 0 {
+        let last_snapshot = if size == 0 {
             write_log_header(&mut log_file, 0)?;
+            None
         } else {
             log_file.seek(SeekFrom::Start(0))?;
-            read_and_verify_header(&mut log_file, &MAGIC_LOG)?;
+            let max_snap = read_and_verify_header(&mut log_file, &MAGIC_LOG)?;
             log_file.seek(SeekFrom::End(0))?;
-        }
+            Some(max_snap)
+        };
         let log_file = BufWriter::with_capacity(1 << 20, log_file);
 
         let mut blob_files = Vec::with_capacity(worker_count);
@@ -210,7 +212,7 @@ impl AppendOnlyDb {
             records_buf: Vec::new(),
             offsets_buf: Vec::new(),
             active_groups: Vec::with_capacity(8192),
-            last_snapshot: None,
+            last_snapshot,
         })
     }
 
