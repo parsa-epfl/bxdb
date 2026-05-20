@@ -19,9 +19,14 @@ path = "src/bin/compress_compare.rs"
 name = "replay-bench"
 path = "src/bin/replay_bench.rs"
 
+[[bin]]
+name = "decompress-time"
+path = "src/bin/decompress_time.rs"
+
 [features]
 default = []
 timing = []
+disable-shared-cache = []
 
 [dependencies]
 zstd = "0.13"

@@ -17,6 +17,7 @@ pub mod format;
 pub mod purge;
 pub mod append_only;
 pub mod btree;
+pub mod timing;
 
 pub use btree::{IndexMode, BtreeDb, shm_cache_path};
 pub use append_only::AppendOnlyDb;

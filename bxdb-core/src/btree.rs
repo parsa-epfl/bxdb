@@ -1,11 +1,11 @@
 use std::cell::RefCell;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{self, BufReader};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 
 thread_local! {
     static ZSTD_DEC: RefCell<zstd::bulk::Decompressor<'static>> =
@@ -21,6 +21,17 @@ use crate::chunk::{
     MAGIC_LOG, MAX_SNAPSHOT_ID, PAGE_SIZE, apply_delta_patch, encode_key, pa_of,
 };
 use crate::format::{peek_magic, read_and_verify_header};
+use crate::timing;
+
+/// Compile-time flag to bypass the shared-memory page cache.
+/// When `true`, `BtreeDb` will not create or consult the
+/// [`SharedCache`](crate::cache::SharedCache) at `/dev/shm`.
+///
+/// Build with `--features disable-shared-cache` to activate,
+/// or flip this constant to `true` / `false` for ad-hoc testing.
+///
+/// By default, we set it to true, based on the empirical study.
+pub const DISABLE_SHARED_CACHE: bool = true;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IndexMode {
@@ -41,7 +52,10 @@ pub(crate) enum IndexSource {
     // B-tree: index.bxdb is mmap'd read-only. Records are fixed-size and
     // sorted by key. The OS page cache handles hot pages; we never load the
     // whole index into our address space as a Vec or BTreeMap.
-    BTree { mmap: Mmap, num_records: usize },
+    BTree {
+        mmap: Mmap,
+        num_records: usize,
+    },
 
     // Append-only: chunks.log is variable-length and unsorted. Bulk loads
     // scan it sequentially per §9; single-page lookups build a sorted
@@ -71,7 +85,7 @@ impl Mmap {
         let file = File::open(path)?;
         let len = file.metadata()?.len() as usize;
         if len == 0 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "empty index file"));
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "empty file"));
         }
         let fd = file.as_raw_fd();
         let raw = unsafe {
@@ -87,7 +101,16 @@ impl Mmap {
         if raw == libc::MAP_FAILED {
             return Err(io::Error::last_os_error());
         }
-        Ok(Self { base: raw as *const u8, len, _file: file })
+        // Disable readahead — index lookups are random (binary search)
+        // and blob reads are random per-page.
+        unsafe {
+            libc::madvise(raw, len, libc::MADV_RANDOM);
+        }
+        Ok(Self {
+            base: raw as *const u8,
+            len,
+            _file: file,
+        })
     }
 
     fn as_bytes(&self) -> &[u8] {
@@ -105,33 +128,48 @@ impl Drop for Mmap {
 
 pub(crate) struct BlobReaders {
     dir: PathBuf,
-    files: RwLock<FxHashMap<u8, Arc<File>>>,
+    files: RwLock<FxHashMap<u8, Arc<Mmap>>>,
 }
 
 impl BlobReaders {
     fn new(dir: &Path) -> Self {
-        Self { dir: dir.to_path_buf(), files: RwLock::new(FxHashMap::default()) }
+        Self {
+            dir: dir.to_path_buf(),
+            files: RwLock::new(FxHashMap::default()),
+        }
     }
 
     pub(crate) fn read(&self, worker_id: u8, offset: u64, len: u32) -> io::Result<Vec<u8>> {
-        let f = self.get(worker_id)?;
-        let mut buf = vec![0u8; len as usize];
-        f.read_exact_at(&mut buf, offset)?;
-        Ok(buf)
+        let mmap = self.get(worker_id)?;
+        let start = offset as usize;
+        let end = start.checked_add(len as usize).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "blob offset+len overflow")
+        })?;
+        let bytes = mmap.as_bytes();
+        if end > bytes.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "blob read out of range",
+            ));
+        }
+        Ok(bytes[start..end].to_vec())
     }
 
-    fn get(&self, worker_id: u8) -> io::Result<Arc<File>> {
-        if let Some(f) = self.files.read().get(&worker_id) {
-            return Ok(Arc::clone(f));
+    fn get(&self, worker_id: u8) -> io::Result<Arc<Mmap>> {
+        if let Some(mmap) = self.files.read().get(&worker_id) {
+            return Ok(Arc::clone(mmap));
         }
-        let path = self.dir.join("blobs").join(format!("worker_{worker_id}.blob"));
-        let file = Arc::new(OpenOptions::new().read(true).open(&path)?);
+        let path = self
+            .dir
+            .join("blobs")
+            .join(format!("worker_{worker_id}.blob"));
+        let mmap = Arc::new(Mmap::open(&path)?);
         let mut w = self.files.write();
-        if let Some(f) = w.get(&worker_id) {
-            return Ok(Arc::clone(f));
+        if let Some(m) = w.get(&worker_id) {
+            return Ok(Arc::clone(m));
         }
-        w.insert(worker_id, Arc::clone(&file));
-        Ok(file)
+        w.insert(worker_id, Arc::clone(&mmap));
+        Ok(mmap)
     }
 }
 
@@ -192,7 +230,10 @@ impl PageStore {
             IndexSource::BTree { mmap, num_records } => {
                 Ok(floor_mmap(mmap.as_bytes(), *num_records, key, pa))
             }
-            IndexSource::AppendOnly { log_path, lazy_index } => {
+            IndexSource::AppendOnly {
+                log_path,
+                lazy_index,
+            } => {
                 let idx = self.ensure_lazy_index(log_path, lazy_index)?;
                 Ok(floor_sorted(&idx.keys, &idx.records, key, pa))
             }
@@ -204,7 +245,10 @@ impl PageStore {
             IndexSource::BTree { mmap, num_records } => {
                 Ok(exact_mmap(mmap.as_bytes(), *num_records, key))
             }
-            IndexSource::AppendOnly { log_path, lazy_index } => {
+            IndexSource::AppendOnly {
+                log_path,
+                lazy_index,
+            } => {
                 let idx = self.ensure_lazy_index(log_path, lazy_index)?;
                 Ok(exact_sorted(&idx.keys, &idx.records, key))
             }
@@ -228,9 +272,20 @@ impl PageStore {
         rec: &ChunkRecord,
         out: &mut [u8; PAGE_SIZE],
     ) -> io::Result<()> {
+        let _t_blob = Instant::now();
         let blob = self.blob_readers.read(rec.worker_id, rec.offset, rec.len)?;
-        let decompressed =
-            ZSTD_DEC.with(|d| d.borrow_mut().decompress(&blob, PAGE_SIZE + 1))?;
+        timing::LOAD_TIMING
+            .blob_read_ns
+            .add(_t_blob.elapsed().as_nanos() as u64);
+        timing::LOAD_TIMING.blob_read_calls.inc();
+
+        let _t_zstd = Instant::now();
+        let decompressed = ZSTD_DEC.with(|d| d.borrow_mut().decompress(&blob, PAGE_SIZE + 1))?;
+        timing::LOAD_TIMING
+            .zstd_decompress_ns
+            .add(_t_zstd.elapsed().as_nanos() as u64);
+        timing::LOAD_TIMING.zstd_decompress_calls.inc();
+
         if decompressed.len() != PAGE_SIZE {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -266,9 +321,7 @@ impl PageStore {
                 }
                 let mut base = [0u8; PAGE_SIZE];
                 self.decompress_full_into(&base_rec, &mut base)?;
-                let delta_blob = self
-                    .blob_readers
-                    .read(rec.worker_id, rec.offset, rec.len)?;
+                let delta_blob = self.blob_readers.read(rec.worker_id, rec.offset, rec.len)?;
                 apply_delta_patch(&base, &delta_blob, out)
             }
         }
@@ -278,7 +331,7 @@ impl PageStore {
 pub struct BtreeDb {
     _dir: PathBuf,
     store: PageStore,
-    cache: SharedCache,
+    cache: Option<SharedCache>,
 }
 
 pub fn shm_cache_path(dir: &Path) -> io::Result<PathBuf> {
@@ -307,8 +360,17 @@ impl BtreeDb {
         let dir = name.as_ref().to_path_buf();
         let canonical = dir.canonicalize().unwrap_or_else(|_| dir.clone());
         let store = PageStore::open(&dir)?;
-        let cache = SharedCache::open(&shm_cache_path(&canonical)?, &canonical)?;
-        Ok(Self { _dir: dir, store, cache })
+        let cache = if DISABLE_SHARED_CACHE {
+            None
+        } else {
+            Some(SharedCache::open(&shm_cache_path(&canonical)?, &canonical)?)
+        };
+        timing::init_timing();
+        Ok(Self {
+            _dir: dir,
+            store,
+            cache,
+        })
     }
 
     pub fn mode(&self) -> IndexMode {
@@ -316,18 +378,27 @@ impl BtreeDb {
     }
 
     pub fn load_page(&self, pa: u64, snapshot_id: u32) -> io::Result<Option<[u8; PAGE_SIZE]>> {
+        let _t_total = Instant::now();
         if snapshot_id > MAX_SNAPSHOT_ID {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "snapshot_id exceeds 19-bit range",
             ));
         }
+        let _t_floor = Instant::now();
         let rec = match self.store.floor(pa, snapshot_id)? {
             Some(r) => r,
             None => return Ok(None),
         };
+        timing::LOAD_TIMING
+            .floor_ns
+            .add(_t_floor.elapsed().as_nanos() as u64);
         let mut out = [0u8; PAGE_SIZE];
         self.resolve_cached(&rec, &mut out)?;
+        timing::LOAD_TIMING
+            .total_ns
+            .add(_t_total.elapsed().as_nanos() as u64);
+        timing::LOAD_TIMING.total_calls.inc();
         Ok(Some(out))
     }
 
@@ -335,32 +406,80 @@ impl BtreeDb {
         match rec.kind {
             ChunkKind::Zero => {
                 out.fill(0);
+                timing::LOAD_TIMING.zero_calls.inc();
                 Ok(())
             }
             ChunkKind::Full => {
-                if self.cache.get(rec.key, out) {
-                    return Ok(());
+                let _t_cache_get = Instant::now();
+                if let Some(ref cache) = self.cache {
+                    if cache.get(rec.key, out) {
+                        timing::LOAD_TIMING
+                            .full_cache_get_ns
+                            .add(_t_cache_get.elapsed().as_nanos() as u64);
+                        timing::LOAD_TIMING.full_cache_hits.inc();
+                        timing::LOAD_TIMING.full_calls.inc();
+                        return Ok(());
+                    }
                 }
+                timing::LOAD_TIMING
+                    .full_cache_get_ns
+                    .add(_t_cache_get.elapsed().as_nanos() as u64);
+
+                let _t_decompress = Instant::now();
                 self.store.decompress_full_into(rec, out)?;
-                self.cache.put(rec.key, out);
+                timing::LOAD_TIMING
+                    .full_decompress_ns
+                    .add(_t_decompress.elapsed().as_nanos() as u64);
+
+                let _t_cache_put = Instant::now();
+                if let Some(ref cache) = self.cache {
+                    cache.put(rec.key, out);
+                }
+                timing::LOAD_TIMING
+                    .full_cache_put_ns
+                    .add(_t_cache_put.elapsed().as_nanos() as u64);
+                timing::LOAD_TIMING.full_calls.inc();
                 Ok(())
             }
             ChunkKind::Delta => {
                 let mut base = [0u8; PAGE_SIZE];
                 self.load_full_cached(rec.base_key, &mut base)?;
-                let delta_blob = self
-                    .store
-                    .blob_readers
-                    .read(rec.worker_id, rec.offset, rec.len)?;
-                apply_delta_patch(&base, &delta_blob, out)
+
+                let _t_delta_blob = Instant::now();
+                let delta_blob =
+                    self.store
+                        .blob_readers
+                        .read(rec.worker_id, rec.offset, rec.len)?;
+                timing::LOAD_TIMING
+                    .delta_blob_read_ns
+                    .add(_t_delta_blob.elapsed().as_nanos() as u64);
+
+                let _t_patch = Instant::now();
+                let r = apply_delta_patch(&base, &delta_blob, out);
+                timing::LOAD_TIMING
+                    .delta_patch_ns
+                    .add(_t_patch.elapsed().as_nanos() as u64);
+                timing::LOAD_TIMING.delta_calls.inc();
+                r
             }
         }
     }
 
     fn load_full_cached(&self, key: u64, out: &mut [u8; PAGE_SIZE]) -> io::Result<()> {
-        if self.cache.get(key, out) {
-            return Ok(());
+        let _t_cache_get = Instant::now();
+        if let Some(ref cache) = self.cache {
+            if cache.get(key, out) {
+                timing::LOAD_TIMING
+                    .delta_base_cache_get_ns
+                    .add(_t_cache_get.elapsed().as_nanos() as u64);
+                return Ok(());
+            }
         }
+        timing::LOAD_TIMING
+            .delta_base_cache_get_ns
+            .add(_t_cache_get.elapsed().as_nanos() as u64);
+
+        let _t_lookup = Instant::now();
         let rec = self.store.exact_lookup(key)?.ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -373,8 +492,23 @@ impl BtreeDb {
                 "delta base is not a Full chunk",
             ));
         }
+        timing::LOAD_TIMING
+            .delta_base_lookup_ns
+            .add(_t_lookup.elapsed().as_nanos() as u64);
+
+        let _t_decompress = Instant::now();
         self.store.decompress_full_into(&rec, out)?;
-        self.cache.put(key, out);
+        timing::LOAD_TIMING
+            .delta_base_decompress_ns
+            .add(_t_decompress.elapsed().as_nanos() as u64);
+
+        let _t_cache_put = Instant::now();
+        if let Some(ref cache) = self.cache {
+            cache.put(key, out);
+        }
+        timing::LOAD_TIMING
+            .delta_base_cache_put_ns
+            .add(_t_cache_put.elapsed().as_nanos() as u64);
         Ok(())
     }
 }
@@ -382,10 +516,16 @@ impl BtreeDb {
 fn verify_index_header(mmap: &Mmap) -> io::Result<()> {
     let bytes = mmap.as_bytes();
     if bytes.len() < HEADER_SIZE {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "index.bxdb too short"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "index.bxdb too short",
+        ));
     }
     if bytes[0..8] != MAGIC_IDX {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "bad index magic"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "bad index magic",
+        ));
     }
     Ok(())
 }
@@ -402,8 +542,8 @@ fn build_lazy_index(path: &Path) -> io::Result<LazyIndex> {
     let meta = file.metadata()?;
     let mut r = BufReader::new(file);
     read_and_verify_header(&mut r, &MAGIC_LOG)?;
-    let capacity = (meta.len().saturating_sub(HEADER_SIZE as u64)
-        / LOG_RECORD_BASE_SIZE as u64) as usize;
+    let capacity =
+        (meta.len().saturating_sub(HEADER_SIZE as u64) / LOG_RECORD_BASE_SIZE as u64) as usize;
     let mut records: Vec<ChunkRecord> = Vec::with_capacity(capacity);
     while let Some(rec) = ChunkRecord::read_from(&mut r)? {
         records.push(rec);
@@ -433,7 +573,11 @@ fn floor_mmap(bytes: &[u8], n: usize, key: u64, pa: u64) -> Option<ChunkRecord> 
     }
     let idx = lo - 1;
     let rec = read_record_at(body, idx).ok()?;
-    if pa_of(rec.key) == pa { Some(rec) } else { None }
+    if pa_of(rec.key) == pa {
+        Some(rec)
+    } else {
+        None
+    }
 }
 
 fn exact_mmap(bytes: &[u8], n: usize, key: u64) -> Option<ChunkRecord> {
@@ -460,7 +604,11 @@ fn floor_sorted(keys: &[u64], records: &[ChunkRecord], key: u64, pa: u64) -> Opt
         return None;
     }
     let rec = records[idx - 1];
-    if pa_of(rec.key) == pa { Some(rec) } else { None }
+    if pa_of(rec.key) == pa {
+        Some(rec)
+    } else {
+        None
+    }
 }
 
 fn exact_sorted(keys: &[u64], records: &[ChunkRecord], key: u64) -> Option<ChunkRecord> {
@@ -483,8 +631,7 @@ fn read_key_at(body: &[u8], idx: usize) -> u64 {
 #[inline]
 fn read_record_at(body: &[u8], idx: usize) -> io::Result<ChunkRecord> {
     let off = idx * FIXED_RECORD_SIZE;
-    let buf: &[u8; FIXED_RECORD_SIZE] =
-        body[off..off + FIXED_RECORD_SIZE].try_into().unwrap();
+    let buf: &[u8; FIXED_RECORD_SIZE] = body[off..off + FIXED_RECORD_SIZE].try_into().unwrap();
     ChunkRecord::decode_fixed(buf)
 }
 
@@ -493,7 +640,10 @@ pub fn detect_mode(dir: &Path) -> io::Result<IndexMode> {
         let mut r = File::open(dir.join("index.bxdb"))?;
         let magic = peek_magic(&mut r)?;
         if magic != MAGIC_IDX {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "bad index magic"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "bad index magic",
+            ));
         }
         Ok(IndexMode::BTree)
     } else if dir.join("chunks.log").exists() {
