@@ -559,7 +559,9 @@ fn floor_mmap(bytes: &[u8], n: usize, key: u64, pa: u64) -> Option<ChunkRecord> 
     // Partition point: smallest idx with record_key(idx) > key.
     let mut lo = 0usize;
     let mut hi = n;
+    let mut jumps = 0u64;
     while lo < hi {
+        jumps += 1;
         let mid = lo + (hi - lo) / 2;
         let k = read_key_at(body, mid);
         if k <= key {
@@ -568,6 +570,7 @@ fn floor_mmap(bytes: &[u8], n: usize, key: u64, pa: u64) -> Option<ChunkRecord> 
             hi = mid;
         }
     }
+    timing::LOAD_TIMING.floor_jumps.add(jumps);
     if lo == 0 {
         return None;
     }
