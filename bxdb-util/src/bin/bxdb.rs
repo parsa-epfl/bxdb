@@ -33,6 +33,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: CacheCmd,
     },
+    /// Validate integrity of chunks.log and blob files
+    Check {
+        /// Database directory (must contain chunks.log)
+        dir: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -98,6 +103,12 @@ fn main() -> ExitCode {
         Cmd::Cache { cmd } => {
             if let Err(e) = run_cache(cmd) {
                 eprintln!("bxdb cache: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+        Cmd::Check { dir } => {
+            if let Err(e) = run_check(&dir) {
+                eprintln!("bxdb check: {e}");
                 return ExitCode::FAILURE;
             }
         }
@@ -181,6 +192,43 @@ fn cmd_cache_delete(dir: &Path) -> std::io::Result<()> {
 
     let _ = std::fs::remove_dir(parent);
 
+    Ok(())
+}
+
+fn run_check(dir: &Path) -> std::io::Result<()> {
+    let report = bxdb::check::check(dir)?;
+
+    println!("total records  : {}", report.total_records);
+    println!("  full          : {}", report.full_count);
+    println!("  delta         : {}", report.delta_count);
+    println!("  zero          : {}", report.zero_count);
+
+    if !report.blob_file_sizes.is_empty() {
+        println!();
+        println!("blob files:");
+        for (id, size) in &report.blob_file_sizes {
+            println!("  worker_{id}.blob  {size} bytes");
+        }
+    }
+
+    if report.ok() {
+        println!();
+        println!("OK — no errors found.");
+    } else {
+        println!();
+        println!("{} error(s) found:", report.errors.len());
+        let limit = report.errors.len().min(50);
+        for e in &report.errors[..limit] {
+            eprintln!("  {e}");
+        }
+        if report.errors.len() > limit {
+            eprintln!("  ... and {} more", report.errors.len() - limit);
+        }
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "integrity check failed",
+        ));
+    }
     Ok(())
 }
 

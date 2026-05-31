@@ -11,6 +11,7 @@ macro_rules! timeit {
 
 pub mod c_api;
 pub mod cache;
+pub mod check;
 pub mod chunk;
 pub mod convert;
 pub mod format;
@@ -19,6 +20,6 @@ pub mod append_only;
 pub mod btree;
 pub mod timing;
 
-pub use btree::{IndexMode, BtreeDb, shm_cache_path};
+pub use btree::{IndexMode, BtreeDb, PageStore, BlobReaders, shm_cache_path};
 pub use append_only::AppendOnlyDb;
 pub use chunk::{DEFAULT_DELTA_THRESHOLD, MAX_SNAPSHOT_ID, PAGE_SIZE, encode_key};

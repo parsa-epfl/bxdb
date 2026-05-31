@@ -42,10 +42,10 @@ pub enum IndexMode {
 // Cache-less reader primitives shared by BtreeDb (single-page, cached) and
 // AppendOnlyDb::load_all_pages (bulk load, uncached: each PA is resolved exactly once
 // per call so caching only adds overhead).
-pub(crate) struct PageStore {
-    source: IndexSource,
-    blob_readers: BlobReaders,
-    mode: IndexMode,
+pub struct PageStore {
+    pub(crate) source: IndexSource,
+    pub blob_readers: BlobReaders,
+    pub(crate) mode: IndexMode,
 }
 
 pub(crate) enum IndexSource {
@@ -126,20 +126,20 @@ impl Drop for Mmap {
     }
 }
 
-pub(crate) struct BlobReaders {
+pub struct BlobReaders {
     dir: PathBuf,
     files: RwLock<FxHashMap<u8, Arc<Mmap>>>,
 }
 
 impl BlobReaders {
-    fn new(dir: &Path) -> Self {
+    pub fn new(dir: &Path) -> Self {
         Self {
             dir: dir.to_path_buf(),
             files: RwLock::new(FxHashMap::default()),
         }
     }
 
-    pub(crate) fn read(&self, worker_id: u8, offset: u64, len: u32) -> io::Result<Vec<u8>> {
+    pub fn read(&self, worker_id: u8, offset: u64, len: u32) -> io::Result<Vec<u8>> {
         let mmap = self.get(worker_id)?;
         let start = offset as usize;
         let end = start.checked_add(len as usize).ok_or_else(|| {
@@ -174,7 +174,7 @@ impl BlobReaders {
 }
 
 impl PageStore {
-    pub(crate) fn open(dir: &Path) -> io::Result<Self> {
+    pub fn open(dir: &Path) -> io::Result<Self> {
         let idx_path = dir.join("index.bxdb");
         let log_path = dir.join("chunks.log");
 
@@ -240,7 +240,7 @@ impl PageStore {
         }
     }
 
-    pub(crate) fn exact_lookup(&self, key: u64) -> io::Result<Option<ChunkRecord>> {
+    pub fn exact_lookup(&self, key: u64) -> io::Result<Option<ChunkRecord>> {
         match &self.source {
             IndexSource::BTree { mmap, num_records } => {
                 Ok(exact_mmap(mmap.as_bytes(), *num_records, key))
@@ -267,7 +267,7 @@ impl PageStore {
         Ok(slot.get_or_init(|| built))
     }
 
-    pub(crate) fn decompress_full_into(
+    pub fn decompress_full_into(
         &self,
         rec: &ChunkRecord,
         out: &mut [u8; PAGE_SIZE],

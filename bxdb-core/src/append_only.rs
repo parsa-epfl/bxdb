@@ -220,6 +220,17 @@ impl AppendOnlyDb {
         &self.dir
     }
 
+    pub fn flush(&mut self) -> io::Result<()> {
+        self.log_file.flush()?;
+        self.log_file.get_ref().sync_data()?;
+        for blob in &self.blob_files {
+            let mut bf = blob.lock();
+            bf.writer.flush()?;
+            bf.writer.get_ref().sync_data()?;
+        }
+        Ok(())
+    }
+
     pub fn save_all_pages(
         &mut self,
         memory: &[u8],

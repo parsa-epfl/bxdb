@@ -59,6 +59,12 @@ pub unsafe extern "C" fn bxdb_close(db: *mut BxdbHandle) {
     if db.is_null() {
         return;
     }
+    {
+        let handle = unsafe { &mut *db };
+        if let BxdbHandle::AppendOnly(w) = handle {
+            let _ = w.flush();
+        }
+    }
     drop(unsafe { Box::from_raw(db) });
 }
 
