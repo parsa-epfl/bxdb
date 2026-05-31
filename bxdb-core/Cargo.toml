@@ -23,6 +23,10 @@ path = "src/bin/replay_bench.rs"
 name = "decompress-time"
 path = "src/bin/decompress_time.rs"
 
+[[bin]]
+name = "convert-to-raw"
+path = "src/bin/convert_to_raw.rs"
+
 [features]
 default = []
 timing = []
