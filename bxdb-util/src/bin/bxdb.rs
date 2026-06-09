@@ -114,15 +114,14 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         }
-<<<<<<< HEAD
         Cmd::Check { dir } => {
             if let Err(e) = run_check(&dir) {
                 eprintln!("bxdb check: {e}");
-=======
+            }
+        }
         Cmd::Stats { dir, snapshot } => {
             if let Err(e) = cmd_stats(&dir, snapshot) {
                 eprintln!("bxdb stats: {e}");
->>>>>>> 808e6cb (feat(bxdb-util): Add program to count zero pages)
                 return ExitCode::FAILURE;
             }
         }
@@ -209,7 +208,6 @@ fn cmd_cache_delete(dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-<<<<<<< HEAD
 fn run_check(dir: &Path) -> std::io::Result<()> {
     let report = bxdb::check::check(dir)?;
 
@@ -244,7 +242,10 @@ fn run_check(dir: &Path) -> std::io::Result<()> {
             "integrity check failed",
         ));
     }
-=======
+    Ok(())
+}
+
+
 fn cmd_stats(dir: &Path, snapshot: Option<u32>) -> std::io::Result<()> {
     use std::fs::File;
     use std::io::BufReader;
@@ -274,7 +275,6 @@ fn cmd_stats(dir: &Path, snapshot: Option<u32>) -> std::io::Result<()> {
     }
     println!("total pages    : {total}");
     println!("non-zero pages : {non_zero}");
->>>>>>> 808e6cb (feat(bxdb-util): Add program to count zero pages)
     Ok(())
 }
 
