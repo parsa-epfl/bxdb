@@ -8,45 +8,12 @@ name = "bxdb"
 crate-type = ["rlib", "cdylib", "staticlib"]
 
 [[bin]]
-name = "compress-bench"
-path = "src/bin/compress_bench.rs"
-
-[[bin]]
-name = "compress-compare"
-path = "src/bin/compress_compare.rs"
-
-[[bin]]
-name = "replay-bench"
-path = "src/bin/replay_bench.rs"
-
-[[bin]]
-name = "decompress-time"
-path = "src/bin/decompress_time.rs"
-
-[[bin]]
 name = "convert-to-raw"
 path = "src/bin/convert_to_raw.rs"
-
-[[bin]]
-name = "compare-bxdb-raw"
-path = "src/bin/compare_bxdb_raw.rs"
-
-[[bin]]
-name = "compare-bxdb-raw-backward"
-path = "src/bin/compare_bxdb_raw_backward.rs"
-
-[[bin]]
-name = "debug-page"
-path = "src/bin/debug_page.rs"
-
-[[bin]]
-name = "debug-page-resolve"
-path = "src/bin/debug_page_resolve.rs"
 
 [features]
 default = []
 timing = []
-disable-shared-cache = []
 
 [dependencies]
 zstd = "0.13"

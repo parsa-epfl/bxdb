@@ -5,7 +5,6 @@ use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use rustc_hash::FxHashMap;
@@ -30,14 +29,6 @@ thread_local! {
 }
 use crate::timing;
 
-/// Compile-time flag to bypass the shared-memory page cache.
-/// When `true`, `BtreeDb` will not create or consult the
-/// [`SharedCache`](crate::cache::SharedCache) at `/dev/shm`.
-///
-/// Build with `--features disable-shared-cache` to activate,
-/// or flip this constant to `true` / `false` for ad-hoc testing.
-///
-/// By default, we set it to true, based on the empirical study.
 pub const DISABLE_SHARED_CACHE: bool = true;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

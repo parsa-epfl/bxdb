@@ -12,42 +12,69 @@
 use std::collections::BTreeSet;
 use std::env;
 use std::fs::{self, File};
-use std::io::{self, BufReader, Read, Write, Seek};
+use std::io::{self, BufReader, Read, Seek, Write};
 use std::process;
 
-use bxdb::chunk::{
-    self, ChunkKind, ChunkRecord, PAGE_SIZE, MAGIC_LOG, HEADER_SIZE,
-    apply_delta_patch,
-};
 use bxdb::btree::PageStore;
+use bxdb::chunk::{
+    self, ChunkKind, ChunkRecord, HEADER_SIZE, MAGIC_LOG, PAGE_SIZE, apply_delta_patch,
+};
 
 const ALIGN: u64 = 4096;
 
 /// Page-aligned mmap'd buffer.
-struct MmapBuf { ptr: *mut u8, len: usize }
+struct MmapBuf {
+    ptr: *mut u8,
+    len: usize,
+}
 impl MmapBuf {
     fn new(size: usize) -> Self {
-        if size == 0 { return Self { ptr: std::ptr::null_mut(), len: 0 }; }
+        if size == 0 {
+            return Self {
+                ptr: std::ptr::null_mut(),
+                len: 0,
+            };
+        }
         let ptr = unsafe {
-            libc::mmap(std::ptr::null_mut(), size,
-                       libc::PROT_READ | libc::PROT_WRITE,
-                       libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0)
+            libc::mmap(
+                std::ptr::null_mut(),
+                size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
         };
-        if ptr == libc::MAP_FAILED { panic!("mmap({size}) failed"); }
-        Self { ptr: ptr as *mut u8, len: size }
+        if ptr == libc::MAP_FAILED {
+            panic!("mmap({size}) failed");
+        }
+        Self {
+            ptr: ptr as *mut u8,
+            len: size,
+        }
     }
     fn as_mut(&mut self) -> &mut [u8] {
-        if self.ptr.is_null() { &mut [] }
-        else { unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) } }
+        if self.ptr.is_null() {
+            &mut []
+        } else {
+            unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+        }
     }
     fn as_ref(&self) -> &[u8] {
-        if self.ptr.is_null() { &[] }
-        else { unsafe { std::slice::from_raw_parts(self.ptr, self.len) } }
+        if self.ptr.is_null() {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+        }
     }
 }
 impl Drop for MmapBuf {
     fn drop(&mut self) {
-        if !self.ptr.is_null() { unsafe { libc::munmap(self.ptr as *mut _, self.len); } }
+        if !self.ptr.is_null() {
+            unsafe {
+                libc::munmap(self.ptr as *mut _, self.len);
+            }
+        }
     }
 }
 unsafe impl Send for MmapBuf {}
@@ -57,10 +84,14 @@ fn write_raw_file(path: &str, addrs: &[u64], memory: &[u8]) -> io::Result<()> {
     let data_off = ((8 + num * 8).wrapping_add(ALIGN - 1)) & !(ALIGN - 1);
     let mut f = File::create(path)?;
     f.write_all(&num.to_le_bytes())?;
-    for &a in addrs { f.write_all(&a.to_le_bytes())?; }
+    for &a in addrs {
+        f.write_all(&a.to_le_bytes())?;
+    }
     let pos = f.stream_position()?;
     let pad = data_off - pos;
-    if pad > 0 { f.write_all(&vec![0u8; pad as usize])?; }
+    if pad > 0 {
+        f.write_all(&vec![0u8; pad as usize])?;
+    }
     for &a in addrs {
         f.write_all(&memory[a as usize..a as usize + PAGE_SIZE])?;
     }
@@ -70,7 +101,8 @@ fn write_raw_file(path: &str, addrs: &[u64], memory: &[u8]) -> io::Result<()> {
 fn flush_snapshot(chain_dir: &str, snap_id: u32, buf: &[u8], dirty: &BTreeSet<u64>) {
     // For snap 0: skip zero pages (buffer is zero-init, no stale version to override).
     // For snap > 0: include zero pages so the loader doesn't find old non-zero versions.
-    let addrs: Vec<u64> = dirty.iter()
+    let addrs: Vec<u64> = dirty
+        .iter()
         .filter(|&&pa| {
             if snap_id == 0 {
                 let off = (pa as usize) * PAGE_SIZE;
@@ -89,7 +121,10 @@ fn flush_snapshot(chain_dir: &str, snap_id: u32, buf: &[u8], dirty: &BTreeSet<u6
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() != 4 {
-        eprintln!("Usage: {} <bxdb_db_dir> <output_name> <memory_size_bytes>", args[0]);
+        eprintln!(
+            "Usage: {} <bxdb_db_dir> <output_name> <memory_size_bytes>",
+            args[0]
+        );
         process::exit(1);
     }
     let db_dir = &args[1];
@@ -100,18 +135,19 @@ fn main() {
         process::exit(1);
     }
     // 1. Open the page store to get blob readers
-    let store = PageStore::open(std::path::Path::new(db_dir))
-        .expect("failed to open bxdb page store");
+    let store =
+        PageStore::open(std::path::Path::new(db_dir)).expect("failed to open bxdb page store");
 
     // 2. Open chunks.log and read header
     let log_path = format!("{db_dir}/chunks.log");
-    let log_file = File::open(&log_path)
-        .expect(&format!("cannot open {log_path}"));
+    let log_file = File::open(&log_path).expect(&format!("cannot open {log_path}"));
     let mut reader = BufReader::new(log_file);
 
     // Verify header (16 bytes: magic + version + max_snap_id)
     let mut header = [0u8; HEADER_SIZE];
-    reader.read_exact(&mut header).expect("failed to read log header");
+    reader
+        .read_exact(&mut header)
+        .expect("failed to read log header");
     if header[0..8] != MAGIC_LOG {
         panic!("bad chunks.log magic");
     }
@@ -131,7 +167,7 @@ fn main() {
     loop {
         let rec = match ChunkRecord::read_from(&mut reader) {
             Ok(Some(r)) => r,
-            Ok(None) => break,  // EOF
+            Ok(None) => break, // EOF
             Err(e) => panic!("read error at record {record_count}: {e}"),
         };
         record_count += 1;
@@ -163,13 +199,20 @@ fn main() {
             ChunkKind::Full => {
                 if let Err(e) = store.decompress_blob_into(&rec, dst.try_into().unwrap()) {
                     let blob_path = format!("{db_dir}/blobs/worker_{}.blob", rec.worker_id);
-                    let blob_len = std::fs::metadata(&blob_path)
-                        .map(|m| m.len()).unwrap_or(0);
-                    eprintln!("Warning: rec {record_count} (snap {snap}, pa=0x{pa:x}) Full decompress failed: {e}");
-                    eprintln!("  worker_id={}, offset={}, len={}, blob_file_size={}, end={}",
-                              rec.worker_id, rec.offset, rec.len, blob_len,
-                              rec.offset as u64 + rec.len as u64);
-                    truncated = true; break;
+                    let blob_len = std::fs::metadata(&blob_path).map(|m| m.len()).unwrap_or(0);
+                    eprintln!(
+                        "Warning: rec {record_count} (snap {snap}, pa=0x{pa:x}) Full decompress failed: {e}"
+                    );
+                    eprintln!(
+                        "  worker_id={}, offset={}, len={}, blob_file_size={}, end={}",
+                        rec.worker_id,
+                        rec.offset,
+                        rec.len,
+                        blob_len,
+                        rec.offset as u64 + rec.len as u64
+                    );
+                    truncated = true;
+                    break;
                 }
             }
             ChunkKind::Delta => {
@@ -178,32 +221,34 @@ fn main() {
                     Ok(Some(r)) => r,
                     _ => {
                         eprintln!("Warning: rec {record_count} delta base not found — truncating");
-                        truncated = true; break;
+                        truncated = true;
+                        break;
                     }
                 };
                 if base_rec.kind != ChunkKind::Full {
                     eprintln!("Warning: rec {record_count} delta base is not Full — truncating");
-                    truncated = true; break;
+                    truncated = true;
+                    break;
                 }
                 if let Err(e) = store.decompress_blob_into(&base_rec, &mut base) {
-                    eprintln!("Warning: rec {record_count} delta base decompress failed: {e} — truncating");
-                    truncated = true; break;
+                    eprintln!(
+                        "Warning: rec {record_count} delta base decompress failed: {e} — truncating"
+                    );
+                    truncated = true;
+                    break;
                 }
                 let delta_blob = match (|| -> io::Result<_> {
                     let mmap = store.blob_readers.mmap(rec.worker_id);
                     let start = rec.offset as usize;
                     let end = start + rec.len as usize;
-                    Ok(mmap
-                        .as_bytes()
-                        .get(start..end)
-                        .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "delta blob out of range"))?)
+                    Ok(mmap.as_bytes().get(start..end).ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::UnexpectedEof, "delta blob out of range")
+                    })?)
                 })() {
                     Ok(b) => b,
                     Err(e) => {
-                        let blob_path =
-                            format!("{db_dir}/blobs/worker_{}.blob", rec.worker_id);
-                        let blob_len =
-                            std::fs::metadata(&blob_path).map(|m| m.len()).unwrap_or(0);
+                        let blob_path = format!("{db_dir}/blobs/worker_{}.blob", rec.worker_id);
+                        let blob_len = std::fs::metadata(&blob_path).map(|m| m.len()).unwrap_or(0);
                         eprintln!(
                             "Warning: rec {record_count} (snap {snap}, pa=0x{pa:x}) delta blob read failed: {e}"
                         );
@@ -215,10 +260,7 @@ fn main() {
                             blob_len,
                             rec.offset as u64 + rec.len as u64
                         );
-                        eprintln!(
-                            "  key=0x{:016x}, base_key=0x{:016x}",
-                            rec.key, rec.base_key
-                        );
+                        eprintln!("  key=0x{:016x}, base_key=0x{:016x}", rec.key, rec.base_key);
                         truncated = true;
                         break;
                     }
@@ -241,14 +283,24 @@ fn main() {
     if !truncated {
         flush_snapshot(&chain_dir, current_snap_id, state.as_ref(), &dirty);
     }
-    let max_snap = if truncated { current_snap_id.saturating_sub(1) } else { current_snap_id };
+    let max_snap = if truncated {
+        current_snap_id.saturating_sub(1)
+    } else {
+        current_snap_id
+    };
 
-    fs::write(format!("{chain_dir}/raw-meta"),
-              format!("current_snap_id={max_snap}\n"))
-        .expect("write raw-meta");
+    fs::write(
+        format!("{chain_dir}/raw-meta"),
+        format!("current_snap_id={max_snap}\n"),
+    )
+    .expect("write raw-meta");
 
-    eprintln!("Done. {} records, {} snapshots flushed → {}",
-              record_count, max_snap + 1, chain_dir);
+    eprintln!(
+        "Done. {} records, {} snapshots flushed → {}",
+        record_count,
+        max_snap + 1,
+        chain_dir
+    );
     if truncated {
         eprintln!("  (snapshot {current_snap_id} was incomplete — chain truncated)");
     }
