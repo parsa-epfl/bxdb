@@ -38,6 +38,14 @@ enum Cmd {
         /// Database directory (must contain chunks.log)
         dir: PathBuf,
     },
+    /// Count non-zero pages in the append-only log
+    Stats {
+        /// Database directory
+        dir: PathBuf,
+        /// Filter by snapshot_id (default: count all snapshots)
+        #[arg(short, long)]
+        snapshot: Option<u32>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -106,9 +114,15 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         }
+<<<<<<< HEAD
         Cmd::Check { dir } => {
             if let Err(e) = run_check(&dir) {
                 eprintln!("bxdb check: {e}");
+=======
+        Cmd::Stats { dir, snapshot } => {
+            if let Err(e) = cmd_stats(&dir, snapshot) {
+                eprintln!("bxdb stats: {e}");
+>>>>>>> 808e6cb (feat(bxdb-util): Add program to count zero pages)
                 return ExitCode::FAILURE;
             }
         }
@@ -195,6 +209,7 @@ fn cmd_cache_delete(dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+<<<<<<< HEAD
 fn run_check(dir: &Path) -> std::io::Result<()> {
     let report = bxdb::check::check(dir)?;
 
@@ -229,6 +244,37 @@ fn run_check(dir: &Path) -> std::io::Result<()> {
             "integrity check failed",
         ));
     }
+=======
+fn cmd_stats(dir: &Path, snapshot: Option<u32>) -> std::io::Result<()> {
+    use std::fs::File;
+    use std::io::BufReader;
+    use bxdb::chunk::{ChunkRecord, ChunkKind, MAGIC_LOG, snapshot_of};
+    use bxdb::format::read_and_verify_header;
+
+    let log_path = dir.join("chunks.log");
+    let log = File::open(&log_path)?;
+    let mut r = BufReader::new(log);
+    read_and_verify_header(&mut r, &MAGIC_LOG)?;
+
+    let mut total = 0u64;
+    let mut non_zero = 0u64;
+    while let Some(rec) = ChunkRecord::read_from(&mut r)? {
+        if let Some(s) = snapshot {
+            if snapshot_of(rec.key) != s {
+                continue;
+            }
+        }
+        total += 1;
+        if rec.kind != ChunkKind::Zero {
+            non_zero += 1;
+        }
+    }
+    if let Some(s) = snapshot {
+        println!("snapshot       : {s}");
+    }
+    println!("total pages    : {total}");
+    println!("non-zero pages : {non_zero}");
+>>>>>>> 808e6cb (feat(bxdb-util): Add program to count zero pages)
     Ok(())
 }
 
