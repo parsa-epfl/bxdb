@@ -70,6 +70,9 @@ pub(crate) struct LoadTiming {
     pub blob_read_calls: Counter,
     pub zstd_decompress_ns: Counter,
     pub zstd_decompress_calls: Counter,
+    // ── Fine-grained breakdown inside decompress_full_into ───────────────
+    pub full_copy_out_ns: Counter,
+    pub full_drop_blob_ns: Counter,
 }
 
 impl LoadTiming {
@@ -96,6 +99,8 @@ impl LoadTiming {
             blob_read_calls: Counter::new(),
             zstd_decompress_ns: Counter::new(),
             zstd_decompress_calls: Counter::new(),
+            full_copy_out_ns: Counter::new(),
+            full_drop_blob_ns: Counter::new(),
         }
     }
 }
@@ -148,6 +153,9 @@ extern "C" fn on_exit_report() {
     let blob_read_calls = LOAD_TIMING.blob_read_calls.get();
     let zstd_decomp_ns = LOAD_TIMING.zstd_decompress_ns.get();
     let zstd_decomp_calls = LOAD_TIMING.zstd_decompress_calls.get();
+
+    let full_copy_out_ns = LOAD_TIMING.full_copy_out_ns.get();
+    let full_drop_blob_ns = LOAD_TIMING.full_drop_blob_ns.get();
 
     // ── build JSON ───────────────────────────────────────────────────────
     use std::fmt::Write;
@@ -218,7 +226,11 @@ extern "C" fn on_exit_report() {
     );
     let _ = write!(
         j,
-        "\"zstd_decompress_ns\":{zstd_decomp_ns},\"zstd_decompress_calls\":{zstd_decomp_calls}}}"
+        "\"zstd_decompress_ns\":{zstd_decomp_ns},\"zstd_decompress_calls\":{zstd_decomp_calls},"
+    );
+    let _ = write!(
+        j,
+        "\"full_copy_out_ns\":{full_copy_out_ns},\"full_drop_blob_ns\":{full_drop_blob_ns}}}"
     );
 
     let _ = write!(j, "}}"); // close phases

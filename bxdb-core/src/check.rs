@@ -10,7 +10,12 @@ use crate::format::read_and_verify_header;
 
 thread_local! {
     static ZSTD_DEC: RefCell<zstd::bulk::Decompressor<'static>> =
-        RefCell::new(zstd::bulk::Decompressor::new().expect("zstd decompressor init"));
+        RefCell::new({
+            let mut d = zstd::bulk::Decompressor::new().expect("zstd decompressor init");
+            d.set_parameter(zstd::zstd_safe::DParameter::WindowLogMax(12))
+                .expect("zstd window log");
+            d
+        });
 }
 
 #[derive(Debug)]
@@ -53,7 +58,7 @@ pub fn check(dir: &Path) -> io::Result<CheckReport> {
         }
     }
 
-    let blob_readers = BlobReaders::new(dir);
+    let blob_readers = BlobReaders::new(dir)?;
 
     let mut report = CheckReport {
         total_records: 0,
@@ -158,8 +163,13 @@ fn check_full(
         ));
         return Ok(());
     }
-    let blob = blob_readers.read(rec.worker_id, rec.offset, rec.len)?;
-    match ZSTD_DEC.with(|d| d.borrow_mut().decompress(&blob, PAGE_SIZE + 1)) {
+    let mmap = blob_readers.mmap(rec.worker_id);
+    let start = rec.offset as usize;
+    let end = start + rec.len as usize;
+    let blob = mmap.as_bytes().get(start..end).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::UnexpectedEof, "blob read out of range")
+    })?;
+    match ZSTD_DEC.with(|d| d.borrow_mut().decompress(blob, PAGE_SIZE + 1)) {
         Ok(out) if out.len() == PAGE_SIZE => {}
         Ok(out) => {
             let pa = pa_of(rec.key);
@@ -213,7 +223,12 @@ fn check_delta(
         ));
         return Ok(());
     }
-    let delta_blob = blob_readers.read(rec.worker_id, rec.offset, rec.len)?;
+    let mmap = blob_readers.mmap(rec.worker_id);
+    let start = rec.offset as usize;
+    let end = start + rec.len as usize;
+    let delta_blob = mmap.as_bytes().get(start..end).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::UnexpectedEof, "delta blob out of range")
+    })?;
     for chunk in delta_blob.chunks_exact(10) {
         let idx = u16::from_le_bytes([chunk[0], chunk[1]]) as usize;
         if idx >= crate::chunk::PAGE_WORDS {

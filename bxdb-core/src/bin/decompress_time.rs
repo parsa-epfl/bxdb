@@ -275,11 +275,12 @@ fn benchmark_load_page(dir: &Path, records: &[ChunkRecord]) -> Vec<u64> {
     for rec in records {
         let pa = pa_of(rec.key);
         let snap = snapshot_of(rec.key);
+        let mut page = [0u8; PAGE_SIZE];
         let t0 = Instant::now();
-        let _page = db
-            .load_page(pa, snap)
-            .expect("load_page failed")
-            .expect("load_page returned None");
+        let found = db
+            .load_page(&mut page, pa, snap)
+            .expect("load_page failed");
+        assert!(found, "load_page returned false");
         load_ns.push(t0.elapsed().as_nanos() as u64);
     }
     load_ns

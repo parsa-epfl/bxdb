@@ -4,23 +4,30 @@ use std::io::{self, BufReader};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::ptr;
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-thread_local! {
-    static ZSTD_DEC: RefCell<zstd::bulk::Decompressor<'static>> =
-        RefCell::new(zstd::bulk::Decompressor::new().expect("zstd decompressor init"));
-}
-
-use parking_lot::RwLock;
 use rustc_hash::FxHashMap;
 
 use crate::cache::SharedCache;
 use crate::chunk::{
     ChunkKind, ChunkRecord, FIXED_RECORD_SIZE, HEADER_SIZE, LOG_RECORD_BASE_SIZE, MAGIC_IDX,
-    MAGIC_LOG, MAX_SNAPSHOT_ID, PAGE_SIZE, apply_delta_patch, encode_key, pa_of,
+    MAGIC_LOG, MAX_SNAPSHOT_ID, PAGE_SIZE, apply_delta_patch_in_place, encode_key, pa_of,
 };
 use crate::format::{peek_magic, read_and_verify_header};
+
+thread_local! {
+    // Compressor uses WindowLog=12, use matching decompressor window
+    // to reduce memory footprint and improve cache locality.
+    static ZSTD_DEC: RefCell<zstd::bulk::Decompressor<'static>> =
+        RefCell::new({
+            let mut d = zstd::bulk::Decompressor::new().expect("zstd decompressor init");
+            d.set_parameter(zstd::zstd_safe::DParameter::WindowLogMax(12))
+                .expect("zstd window log");
+            d
+        });
+}
 use crate::timing;
 
 /// Compile-time flag to bypass the shared-memory page cache.
@@ -71,7 +78,7 @@ pub(crate) struct LazyIndex {
     records: Vec<ChunkRecord>,
 }
 
-pub(crate) struct Mmap {
+pub struct Mmap {
     base: *const u8,
     len: usize,
     _file: File,
@@ -85,7 +92,11 @@ impl Mmap {
         let file = File::open(path)?;
         let len = file.metadata()?.len() as usize;
         if len == 0 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "empty file"));
+            return Ok(Self {
+                base: ptr::NonNull::dangling().as_ptr(),
+                len: 0,
+                _file: file,
+            });
         }
         let fd = file.as_raw_fd();
         let raw = unsafe {
@@ -101,11 +112,6 @@ impl Mmap {
         if raw == libc::MAP_FAILED {
             return Err(io::Error::last_os_error());
         }
-        // Disable readahead — index lookups are random (binary search)
-        // and blob reads are random per-page.
-        unsafe {
-            libc::madvise(raw, len, libc::MADV_RANDOM);
-        }
         Ok(Self {
             base: raw as *const u8,
             len,
@@ -113,63 +119,56 @@ impl Mmap {
         })
     }
 
-    fn as_bytes(&self) -> &[u8] {
+    pub fn as_bytes(&self) -> &[u8] {
         unsafe { std::slice::from_raw_parts(self.base, self.len) }
     }
 }
 
 impl Drop for Mmap {
     fn drop(&mut self) {
-        if !self.base.is_null() {
+        if self.len > 0 && !self.base.is_null() {
             unsafe { libc::munmap(self.base as *mut libc::c_void, self.len) };
         }
     }
 }
 
 pub struct BlobReaders {
-    dir: PathBuf,
-    files: RwLock<FxHashMap<u8, Arc<Mmap>>>,
+    files: Vec<Mmap>,
+    /// Map worker_id → index into `files`. All blob files as found on disk.
+    by_id: FxHashMap<u8, usize>,
 }
 
 impl BlobReaders {
-    pub fn new(dir: &Path) -> Self {
-        Self {
-            dir: dir.to_path_buf(),
-            files: RwLock::new(FxHashMap::default()),
+    pub fn new(dir: &Path) -> io::Result<Self> {
+        let blobs_dir = dir.join("blobs");
+        let mut paths: Vec<(u8, PathBuf)> = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&blobs_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if let Some(rest) = name.strip_prefix("worker_") {
+                    if let Some(digits) = rest.strip_suffix(".blob") {
+                        if let Ok(id) = digits.parse::<u8>() {
+                            paths.push((id, entry.path()));
+                        }
+                    }
+                }
+            }
         }
+        paths.sort_by_key(|(id, _)| *id);
+        let mut files: Vec<Mmap> = Vec::with_capacity(paths.len());
+        let mut by_id: FxHashMap<u8, usize> = FxHashMap::default();
+        for (id, path) in paths {
+            let idx = files.len();
+            files.push(Mmap::open(&path)?);
+            by_id.insert(id, idx);
+        }
+        Ok(Self { files, by_id })
     }
 
-    pub fn read(&self, worker_id: u8, offset: u64, len: u32) -> io::Result<Vec<u8>> {
-        let mmap = self.get(worker_id)?;
-        let start = offset as usize;
-        let end = start.checked_add(len as usize).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "blob offset+len overflow")
-        })?;
-        let bytes = mmap.as_bytes();
-        if end > bytes.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "blob read out of range",
-            ));
-        }
-        Ok(bytes[start..end].to_vec())
-    }
-
-    fn get(&self, worker_id: u8) -> io::Result<Arc<Mmap>> {
-        if let Some(mmap) = self.files.read().get(&worker_id) {
-            return Ok(Arc::clone(mmap));
-        }
-        let path = self
-            .dir
-            .join("blobs")
-            .join(format!("worker_{worker_id}.blob"));
-        let mmap = Arc::new(Mmap::open(&path)?);
-        let mut w = self.files.write();
-        if let Some(m) = w.get(&worker_id) {
-            return Ok(Arc::clone(m));
-        }
-        w.insert(worker_id, Arc::clone(&mmap));
-        Ok(mmap)
+    pub fn mmap(&self, worker_id: u8) -> &Mmap {
+        let idx = self.by_id.get(&worker_id).expect("worker blob not found");
+        &self.files[*idx]
     }
 }
 
@@ -207,7 +206,7 @@ impl PageStore {
         };
 
         Ok(Self {
-            blob_readers: BlobReaders::new(dir),
+            blob_readers: BlobReaders::new(dir)?,
             source,
             mode,
         })
@@ -224,7 +223,7 @@ impl PageStore {
         }
     }
 
-    pub(crate) fn floor(&self, pa: u64, snapshot_id: u32) -> io::Result<Option<ChunkRecord>> {
+    pub fn floor(&self, pa: u64, snapshot_id: u32) -> io::Result<Option<ChunkRecord>> {
         let key = encode_key(pa, snapshot_id);
         match &self.source {
             IndexSource::BTree { mmap, num_records } => {
@@ -267,32 +266,52 @@ impl PageStore {
         Ok(slot.get_or_init(|| built))
     }
 
-    pub fn decompress_full_into(
+    pub fn idx_mmap(&self) -> &Mmap {
+        match &self.source {
+            IndexSource::BTree { mmap, .. } => mmap,
+            _ => panic!("idx_mmap called on non-BTree PageStore"),
+        }
+    }
+
+    pub fn decompress_blob_into(
         &self,
         rec: &ChunkRecord,
         out: &mut [u8; PAGE_SIZE],
     ) -> io::Result<()> {
         let _t_blob = Instant::now();
-        let blob = self.blob_readers.read(rec.worker_id, rec.offset, rec.len)?;
+        let mmap = self.blob_readers.mmap(rec.worker_id);
+        let start = rec.offset as usize;
+        let end = start.checked_add(rec.len as usize).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "blob offset+len overflow")
+        })?;
+        let bytes = mmap.as_bytes();
+        if end > bytes.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "blob read out of range",
+            ));
+        }
+        let blob = &bytes[start..end];
+        let _ = blob.first();
+        let _ = blob.get(blob.len().saturating_sub(1));
         timing::LOAD_TIMING
             .blob_read_ns
             .add(_t_blob.elapsed().as_nanos() as u64);
         timing::LOAD_TIMING.blob_read_calls.inc();
 
         let _t_zstd = Instant::now();
-        let decompressed = ZSTD_DEC.with(|d| d.borrow_mut().decompress(&blob, PAGE_SIZE + 1))?;
+        let written = ZSTD_DEC.with(|d| d.borrow_mut().decompress_to_buffer(blob, out))?;
         timing::LOAD_TIMING
             .zstd_decompress_ns
             .add(_t_zstd.elapsed().as_nanos() as u64);
         timing::LOAD_TIMING.zstd_decompress_calls.inc();
 
-        if decompressed.len() != PAGE_SIZE {
+        if written != PAGE_SIZE {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "Full chunk decompressed size != 4096",
+                "decompressed size != 4096",
             ));
         }
-        out.copy_from_slice(&decompressed);
         Ok(())
     }
 
@@ -305,7 +324,7 @@ impl PageStore {
     ) -> io::Result<()> {
         match rec.kind {
             ChunkKind::Zero => Ok(()),
-            ChunkKind::Full => self.decompress_full_into(rec, out),
+            ChunkKind::Full => self.decompress_blob_into(rec, out),
             ChunkKind::Delta => {
                 let base_rec = self.exact_lookup(rec.base_key)?.ok_or_else(|| {
                     io::Error::new(
@@ -319,18 +338,22 @@ impl PageStore {
                         "delta base is not a Full chunk",
                     ));
                 }
-                let mut base = [0u8; PAGE_SIZE];
-                self.decompress_full_into(&base_rec, &mut base)?;
-                let delta_blob = self.blob_readers.read(rec.worker_id, rec.offset, rec.len)?;
-                apply_delta_patch(&base, &delta_blob, out)
+                self.decompress_blob_into(&base_rec, out)?;
+                let mmap = self.blob_readers.mmap(rec.worker_id);
+                let start = rec.offset as usize;
+                let end = start + rec.len as usize;
+                let delta_blob = mmap.as_bytes().get(start..end).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::UnexpectedEof, "delta blob out of range")
+                })?;
+                apply_delta_patch_in_place(delta_blob, out)
             }
         }
     }
 }
 
 pub struct BtreeDb {
-    _dir: PathBuf,
-    store: PageStore,
+    pub(crate) _dir: PathBuf,
+    pub store: PageStore,
     cache: Option<SharedCache>,
 }
 
@@ -377,7 +400,12 @@ impl BtreeDb {
         self.store.mode()
     }
 
-    pub fn load_page(&self, pa: u64, snapshot_id: u32) -> io::Result<Option<[u8; PAGE_SIZE]>> {
+    pub fn load_page(
+        &self,
+        out: &mut [u8; PAGE_SIZE],
+        pa: u64,
+        snapshot_id: u32,
+    ) -> io::Result<bool> {
         let _t_total = Instant::now();
         if snapshot_id > MAX_SNAPSHOT_ID {
             return Err(io::Error::new(
@@ -388,18 +416,17 @@ impl BtreeDb {
         let _t_floor = Instant::now();
         let rec = match self.store.floor(pa, snapshot_id)? {
             Some(r) => r,
-            None => return Ok(None),
+            None => return Ok(false),
         };
         timing::LOAD_TIMING
             .floor_ns
             .add(_t_floor.elapsed().as_nanos() as u64);
-        let mut out = [0u8; PAGE_SIZE];
-        self.resolve_cached(&rec, &mut out)?;
+        self.resolve_cached(&rec, out)?;
         timing::LOAD_TIMING
             .total_ns
             .add(_t_total.elapsed().as_nanos() as u64);
         timing::LOAD_TIMING.total_calls.inc();
-        Ok(Some(out))
+        Ok(true)
     }
 
     fn resolve_cached(&self, rec: &ChunkRecord, out: &mut [u8; PAGE_SIZE]) -> io::Result<()> {
@@ -426,7 +453,7 @@ impl BtreeDb {
                     .add(_t_cache_get.elapsed().as_nanos() as u64);
 
                 let _t_decompress = Instant::now();
-                self.store.decompress_full_into(rec, out)?;
+                self.store.decompress_blob_into(rec, out)?;
                 timing::LOAD_TIMING
                     .full_decompress_ns
                     .add(_t_decompress.elapsed().as_nanos() as u64);
@@ -442,20 +469,21 @@ impl BtreeDb {
                 Ok(())
             }
             ChunkKind::Delta => {
-                let mut base = [0u8; PAGE_SIZE];
-                self.load_full_cached(rec.base_key, &mut base)?;
+                self.load_full_cached(rec.base_key, out)?;
 
                 let _t_delta_blob = Instant::now();
-                let delta_blob =
-                    self.store
-                        .blob_readers
-                        .read(rec.worker_id, rec.offset, rec.len)?;
+                let mmap = self.store.blob_readers.mmap(rec.worker_id);
+                let start = rec.offset as usize;
+                let end = start + rec.len as usize;
+                let delta_blob = mmap.as_bytes().get(start..end).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::UnexpectedEof, "delta blob out of range")
+                })?;
                 timing::LOAD_TIMING
                     .delta_blob_read_ns
                     .add(_t_delta_blob.elapsed().as_nanos() as u64);
 
                 let _t_patch = Instant::now();
-                let r = apply_delta_patch(&base, &delta_blob, out);
+                let r = apply_delta_patch_in_place(delta_blob, out);
                 timing::LOAD_TIMING
                     .delta_patch_ns
                     .add(_t_patch.elapsed().as_nanos() as u64);
@@ -497,7 +525,7 @@ impl BtreeDb {
             .add(_t_lookup.elapsed().as_nanos() as u64);
 
         let _t_decompress = Instant::now();
-        self.store.decompress_full_into(&rec, out)?;
+        self.store.decompress_blob_into(&rec, out)?;
         timing::LOAD_TIMING
             .delta_base_decompress_ns
             .add(_t_decompress.elapsed().as_nanos() as u64);

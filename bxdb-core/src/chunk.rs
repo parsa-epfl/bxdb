@@ -181,6 +181,21 @@ pub fn apply_delta_patch(base: &[u8; PAGE_SIZE], blob: &[u8], out: &mut [u8; PAG
         ));
     }
     out.copy_from_slice(base);
+    apply_delta_xor(blob, out)
+}
+
+/// Apply delta XOR words in-place. Assumes `out` already contains the base page.
+pub fn apply_delta_patch_in_place(blob: &[u8], out: &mut [u8; PAGE_SIZE]) -> io::Result<()> {
+    if blob.len() % 10 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "delta blob length not multiple of 10",
+        ));
+    }
+    apply_delta_xor(blob, out)
+}
+
+fn apply_delta_xor(blob: &[u8], out: &mut [u8; PAGE_SIZE]) -> io::Result<()> {
     for chunk in blob.chunks_exact(10) {
         let idx = u16::from_le_bytes([chunk[0], chunk[1]]) as usize;
         let xor = u64::from_le_bytes(chunk[2..10].try_into().unwrap());

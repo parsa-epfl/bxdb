@@ -5,6 +5,11 @@
 //!
 //! Streams chunks.log in natural (snapshot_id, PA) order — no index scan,
 //! no per-snapshot bulk loads.  Produces <output_name>.rawmem-test/ chain.
+//!
+//! Each file stores only the pages touched in that snapshot (incremental).
+//! Pages that became zero are written explicitly so the loader's backward
+//! search doesn't find a stale non-zero version in an earlier snapshot.
+use std::collections::BTreeSet;
 use std::env;
 use std::fs::{self, File};
 use std::io::{self, BufReader, Read, Write, Seek};
@@ -47,17 +52,6 @@ impl Drop for MmapBuf {
 }
 unsafe impl Send for MmapBuf {}
 
-fn collect_addrs(buf: &[u8], page_count: u64) -> Vec<u64> {
-    let mut addrs = Vec::with_capacity(page_count as usize);
-    for i in 0..page_count {
-        let off = (i * PAGE_SIZE as u64) as usize;
-        if !buf[off..off + PAGE_SIZE].iter().all(|&b| b == 0) {
-            addrs.push(i * PAGE_SIZE as u64);
-        }
-    }
-    addrs
-}
-
 fn write_raw_file(path: &str, addrs: &[u64], memory: &[u8]) -> io::Result<()> {
     let num = addrs.len() as u64;
     let data_off = ((8 + num * 8).wrapping_add(ALIGN - 1)) & !(ALIGN - 1);
@@ -73,11 +67,23 @@ fn write_raw_file(path: &str, addrs: &[u64], memory: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-fn flush_snapshot(chain_dir: &str, snap_id: u32, buf: &[u8], page_count: u64) {
-    let addrs = collect_addrs(buf, page_count);
+fn flush_snapshot(chain_dir: &str, snap_id: u32, buf: &[u8], dirty: &BTreeSet<u64>) {
+    // For snap 0: skip zero pages (buffer is zero-init, no stale version to override).
+    // For snap > 0: include zero pages so the loader doesn't find old non-zero versions.
+    let addrs: Vec<u64> = dirty.iter()
+        .filter(|&&pa| {
+            if snap_id == 0 {
+                let off = (pa as usize) * PAGE_SIZE;
+                !buf[off..off + PAGE_SIZE].iter().all(|&b| b == 0)
+            } else {
+                true
+            }
+        })
+        .map(|&pa| pa * PAGE_SIZE as u64)
+        .collect();
     let path = format!("{chain_dir}/{snap_id}");
     write_raw_file(&path, &addrs, buf).expect("write failed");
-    eprintln!("  [{snap_id}] {nz} non-zero pages → {path}", nz = addrs.len());
+    eprintln!("  [{snap_id}] {nz} pages → {path}", nz = addrs.len());
 }
 
 fn main() {
@@ -93,8 +99,6 @@ fn main() {
         eprintln!("memory_size must be a positive multiple of {PAGE_SIZE}");
         process::exit(1);
     }
-    let page_count = memory_size / PAGE_SIZE as u64;
-
     // 1. Open the page store to get blob readers
     let store = PageStore::open(std::path::Path::new(db_dir))
         .expect("failed to open bxdb page store");
@@ -120,9 +124,8 @@ fn main() {
     // 4. Stream chunks.log, building state and flushing at snapshot boundaries
     let mut current_snap_id: u32 = 0;
     let mut record_count: u64 = 0;
-    let mut last_pa: u64 = 0; // for monotonicity check within a snapshot
-
-    eprintln!("Streaming chunks.log → {chain_dir}/ ({} GB)", memory_size as f64 / 1e9);
+    let mut last_pa: u64 = 0;
+    let mut dirty: BTreeSet<u64> = BTreeSet::new();
 
     let mut truncated = false;
     loop {
@@ -141,7 +144,8 @@ fn main() {
         }
 
         if snap != current_snap_id {
-            flush_snapshot(&chain_dir, current_snap_id, state.as_ref(), page_count);
+            flush_snapshot(&chain_dir, current_snap_id, state.as_ref(), &dirty);
+            dirty.clear();
             current_snap_id = snap;
             last_pa = pa;
         } else {
@@ -152,10 +156,12 @@ fn main() {
         }
 
         // Resolve the chunk into the state buffer
-        let dst = &mut state.as_mut()[pa as usize..pa as usize + PAGE_SIZE];
+        dirty.insert(pa);
+        let byte_off = (pa as usize) * PAGE_SIZE;
+        let dst = &mut state.as_mut()[byte_off..byte_off + PAGE_SIZE];
         match rec.kind {
             ChunkKind::Full => {
-                if let Err(e) = store.decompress_full_into(&rec, dst.try_into().unwrap()) {
+                if let Err(e) = store.decompress_blob_into(&rec, dst.try_into().unwrap()) {
                     let blob_path = format!("{db_dir}/blobs/worker_{}.blob", rec.worker_id);
                     let blob_len = std::fs::metadata(&blob_path)
                         .map(|m| m.len()).unwrap_or(0);
@@ -179,29 +185,50 @@ fn main() {
                     eprintln!("Warning: rec {record_count} delta base is not Full — truncating");
                     truncated = true; break;
                 }
-                if let Err(e) = store.decompress_full_into(&base_rec, &mut base) {
+                if let Err(e) = store.decompress_blob_into(&base_rec, &mut base) {
                     eprintln!("Warning: rec {record_count} delta base decompress failed: {e} — truncating");
                     truncated = true; break;
                 }
-                let delta_blob = match store.blob_readers.read(rec.worker_id, rec.offset, rec.len) {
+                let delta_blob = match (|| -> io::Result<_> {
+                    let mmap = store.blob_readers.mmap(rec.worker_id);
+                    let start = rec.offset as usize;
+                    let end = start + rec.len as usize;
+                    Ok(mmap
+                        .as_bytes()
+                        .get(start..end)
+                        .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "delta blob out of range"))?)
+                })() {
                     Ok(b) => b,
                     Err(e) => {
-                        // Fetch blob file size for diagnosis
-                        let blob_path = format!("{db_dir}/blobs/worker_{}.blob", rec.worker_id);
-                        let blob_len = std::fs::metadata(&blob_path)
-                            .map(|m| m.len()).unwrap_or(0);
-                        eprintln!("Warning: rec {record_count} (snap {snap}, pa=0x{pa:x}) delta blob read failed: {e}");
-                        eprintln!("  worker_id={}, offset={}, len={}, blob_file_size={}, end={}",
-                                  rec.worker_id, rec.offset, rec.len, blob_len,
-                                  rec.offset as u64 + rec.len as u64);
-                        eprintln!("  key=0x{:016x}, base_key=0x{:016x}",
-                                  rec.key, rec.base_key);
-                        truncated = true; break;
+                        let blob_path =
+                            format!("{db_dir}/blobs/worker_{}.blob", rec.worker_id);
+                        let blob_len =
+                            std::fs::metadata(&blob_path).map(|m| m.len()).unwrap_or(0);
+                        eprintln!(
+                            "Warning: rec {record_count} (snap {snap}, pa=0x{pa:x}) delta blob read failed: {e}"
+                        );
+                        eprintln!(
+                            "  worker_id={}, offset={}, len={}, blob_file_size={}, end={}",
+                            rec.worker_id,
+                            rec.offset,
+                            rec.len,
+                            blob_len,
+                            rec.offset as u64 + rec.len as u64
+                        );
+                        eprintln!(
+                            "  key=0x{:016x}, base_key=0x{:016x}",
+                            rec.key, rec.base_key
+                        );
+                        truncated = true;
+                        break;
                     }
                 };
-                if let Err(e) = apply_delta_patch(&base, &delta_blob, dst.try_into().unwrap()) {
-                    eprintln!("Warning: rec {record_count} delta patch apply failed: {e} — truncating");
-                    truncated = true; break;
+                if let Err(e) = apply_delta_patch(&base, delta_blob, dst.try_into().unwrap()) {
+                    eprintln!(
+                        "Warning: rec {record_count} delta patch apply failed: {e} — truncating"
+                    );
+                    truncated = true;
+                    break;
                 }
             }
             ChunkKind::Zero => {
@@ -212,7 +239,7 @@ fn main() {
 
     // Flush final snapshot only if we didn't truncate mid-stream
     if !truncated {
-        flush_snapshot(&chain_dir, current_snap_id, state.as_ref(), page_count);
+        flush_snapshot(&chain_dir, current_snap_id, state.as_ref(), &dirty);
     }
     let max_snap = if truncated { current_snap_id.saturating_sub(1) } else { current_snap_id };
 

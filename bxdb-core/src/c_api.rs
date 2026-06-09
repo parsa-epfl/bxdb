@@ -121,17 +121,13 @@ pub unsafe extern "C" fn bxdb_load_page(
     if db.is_null() || page.is_null() {
         return false;
     }
-    let handle = unsafe { &*db };
+    let handle = unsafe { &mut *db };
     let btree_db = match handle {
         BxdbHandle::Btree(r) => r,
         _ => return false,
     };
-    match btree_db.load_page(pa, snapshot_id) {
-        Ok(Some(p)) => {
-            let out = unsafe { slice::from_raw_parts_mut(page as *mut u8, PAGE_SIZE) };
-            out.copy_from_slice(&p);
-            true
-        }
+    match btree_db.load_page(unsafe { &mut *(page as *mut [u8; 4096]) }, pa, snapshot_id) {
+        Ok(true) => true,
         _ => false,
     }
 }

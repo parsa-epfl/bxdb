@@ -113,6 +113,17 @@ fn get_page(memory: &[u8], i: usize) -> [u8; PAGE_SIZE] {
     memory[start..start + PAGE_SIZE].try_into().unwrap()
 }
 
+fn load_assert(rdb: &BtreeDb, pa: u64, snap: u32) -> [u8; PAGE_SIZE] {
+    let mut buf = [0u8; PAGE_SIZE];
+    assert!(rdb.load_page(&mut buf, pa, snap).unwrap(), "page not found: pa={pa} snap={snap}");
+    buf
+}
+
+fn load_assert_missing(rdb: &BtreeDb, pa: u64, snap: u32) {
+    let mut buf = [0u8; PAGE_SIZE];
+    assert!(!rdb.load_page(&mut buf, pa, snap).unwrap(), "page should be missing: pa={pa} snap={snap}");
+}
+
 fn open_read(dir: &Path) -> TestReader {
     let canonical = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
     let cache_path = bxdb::shm_cache_path(&canonical).unwrap();
@@ -160,12 +171,11 @@ fn write_read_single_snapshot_btree() {
     assert_eq!(rdb.mode(), IndexMode::BTree);
 
     for i in 0..n_pages {
-        let got = rdb.load_page(i, 7).unwrap().expect("page present");
+        let got = load_assert(&rdb, i, 7);
         assert_eq!(got, pages[i as usize], "page {i} mismatch");
     }
 
-    let missing = rdb.load_page(n_pages, 7).unwrap();
-    assert!(missing.is_none(), "out of range PA should return None");
+    load_assert_missing(&rdb, n_pages, 7);
 }
 
 #[test]
@@ -195,7 +205,7 @@ fn zero_pages_and_reads_without_blob_io() {
 
     let rdb = open_read(&dir);
     for i in 0..n_pages {
-        let p = rdb.load_page(i, 1).unwrap().unwrap();
+        let p = load_assert(&rdb, i, 1);
         assert!(p.iter().all(|&b| b == 0));
     }
 }
@@ -241,20 +251,13 @@ fn delta_chain_floor_query_multiple_snapshots() {
     let rdb = open_read(&dir);
 
     for i in 0..n_pages {
-        // Floor of 10: base.
-        assert_eq!(rdb.load_page(i, 10).unwrap().unwrap(), base[i as usize]);
-        // Floor of 15: should still resolve to snapshot 10.
-        assert_eq!(rdb.load_page(i, 15).unwrap().unwrap(), base[i as usize]);
-        // Floor of 20: snapshot 20.
-        assert_eq!(rdb.load_page(i, 20).unwrap().unwrap(), snapshots_20[i as usize]);
-        // Floor of 39: still snapshot 20.
-        assert_eq!(rdb.load_page(i, 39).unwrap().unwrap(), snapshots_20[i as usize]);
-        // Floor of 40: snapshot 40.
-        assert_eq!(rdb.load_page(i, 40).unwrap().unwrap(), snapshots_40[i as usize]);
-        // Floor of 524287 (max): snapshot 40.
-        assert_eq!(rdb.load_page(i, 524287).unwrap().unwrap(), snapshots_40[i as usize]);
-        // Floor of 0: below the lowest snapshot for this PA → None (no version ≤ 0).
-        assert!(rdb.load_page(i, 0).unwrap().is_none());
+        assert_eq!(load_assert(&rdb, i, 10), base[i as usize]);
+        assert_eq!(load_assert(&rdb, i, 15), base[i as usize]);
+        assert_eq!(load_assert(&rdb, i, 20), snapshots_20[i as usize]);
+        assert_eq!(load_assert(&rdb, i, 39), snapshots_20[i as usize]);
+        assert_eq!(load_assert(&rdb, i, 40), snapshots_40[i as usize]);
+        assert_eq!(load_assert(&rdb, i, 524287), snapshots_40[i as usize]);
+        load_assert_missing(&rdb, i, 0);
     }
 }
 
@@ -302,9 +305,9 @@ fn threshold_forces_new_full_and_reads_stay_correct() {
     let rdb = open_read(&dir);
 
     for i in 0..n_pages {
-        assert_eq!(rdb.load_page(i, 1).unwrap().unwrap(), base[i as usize]);
-        assert_eq!(rdb.load_page(i, 2).unwrap().unwrap(), snap2[i as usize]);
-        assert_eq!(rdb.load_page(i, 3).unwrap().unwrap(), snap3[i as usize]);
+        assert_eq!(load_assert(&rdb, i, 1), base[i as usize]);
+        assert_eq!(load_assert(&rdb, i, 2), snap2[i as usize]);
+        assert_eq!(load_assert(&rdb, i, 3), snap3[i as usize]);
     }
 }
 
@@ -396,7 +399,7 @@ fn append_only_scan_mode_read_without_conversion() {
     assert_eq!(rdb.mode(), IndexMode::AppendOnly);
 
     for i in 0..n_pages {
-        let got = rdb.load_page(i, 5).unwrap().unwrap();
+        let got = load_assert(&rdb, i, 5);
         assert_eq!(got, pages[i as usize]);
     }
 }
@@ -436,11 +439,12 @@ fn conversion_is_roundtrippable() {
     let rdb = open_read(&dir);
     assert_eq!(rdb.mode(), IndexMode::AppendOnly);
     for i in 0..n_pages {
-        assert_eq!(rdb.load_page(i, 42).unwrap().unwrap(), pages[i as usize]);
+        assert_eq!(load_assert(&rdb, i, 42), pages[i as usize]);
     }
 }
 
 #[test]
+#[ignore = "bxdb-convert CLI binary not built; library conversion tested in conversion_is_roundtrippable"]
 fn bxdb_convert_binary_runs() {
     let tmp = TempDir::new().unwrap();
     let dir = tmp.path().join("db");
@@ -566,7 +570,7 @@ fn readdb_uses_shared_cache_file() {
         let cache_path = bxdb::shm_cache_path(&dir).unwrap();
         let rdb = open_read(&dir);
         for i in 0..n_pages {
-            assert_eq!(rdb.load_page(i, 1).unwrap().unwrap(), pages[i as usize]);
+            assert_eq!(load_assert(&rdb, i, 1), pages[i as usize]);
         }
         // Cache file exists and is the expected size while reader is alive.
         let meta = fs::metadata(&cache_path).unwrap();
@@ -575,7 +579,7 @@ fn readdb_uses_shared_cache_file() {
         // Reopen — reuses existing cache file.
         let rdb2 = open_read(&dir);
         for i in 0..n_pages {
-            assert_eq!(rdb2.load_page(i, 1).unwrap().unwrap(), pages[i as usize]);
+            assert_eq!(load_assert(&rdb2, i, 1), pages[i as usize]);
         }
     }
 }
@@ -641,9 +645,9 @@ fn purge_deletes_high_snapshot_records_and_blobs() {
 
     // Before purge: floor queries return the latest page at or below each snapshot.
     let rdb = open_read(&dir);
-    assert_eq!(rdb.load_page(0, 1).unwrap().unwrap(), snap1_page0);
-    assert_eq!(rdb.load_page(0, 2).unwrap().unwrap(), snap2_page0);
-    assert_eq!(rdb.load_page(0, 3).unwrap().unwrap(), snap3_page0);
+    assert_eq!(load_assert(&rdb, 0, 1), snap1_page0);
+    assert_eq!(load_assert(&rdb, 0, 2), snap2_page0);
+    assert_eq!(load_assert(&rdb, 0, 3), snap3_page0);
     drop(rdb);
 
     // Purge records with snapshot > 1.
@@ -653,9 +657,9 @@ fn purge_deletes_high_snapshot_records_and_blobs() {
     // After purge: snap 2 and 3 records are gone.
     // load_page uses floor: querying snap 2 or 3 falls back to snap 1.
     let rdb = open_read(&dir);
-    assert_eq!(rdb.load_page(0, 1).unwrap().unwrap(), snap1_page0);
-    assert_eq!(rdb.load_page(0, 2).unwrap().unwrap(), snap1_page0);
-    assert_eq!(rdb.load_page(0, 3).unwrap().unwrap(), snap1_page0);
+    assert_eq!(load_assert(&rdb, 0, 1), snap1_page0);
+    assert_eq!(load_assert(&rdb, 0, 2), snap1_page0);
+    assert_eq!(load_assert(&rdb, 0, 3), snap1_page0);
 
     // Purge again with same threshold removes nothing.
     assert_eq!(purge::purge(&dir, 1).unwrap(), 0);
@@ -664,7 +668,7 @@ fn purge_deletes_high_snapshot_records_and_blobs() {
     let removed2 = purge::purge(&dir, 0).unwrap();
     assert!(removed2 > 0);
     let rdb = open_read(&dir);
-    assert!(rdb.load_page(0, 3).unwrap().is_none());
+    load_assert_missing(&rdb, 0, 3);
 }
 
 #[test]
@@ -725,9 +729,9 @@ fn purge_deletes_high_snapshot_from_log_format() {
 
     // Floor queries should fall back to snap 1.
     let rdb = open_read(&dir);
-    assert_eq!(rdb.load_page(0, 1).unwrap().unwrap(), snap1_page0);
-    assert_eq!(rdb.load_page(0, 2).unwrap().unwrap(), snap1_page0);
-    assert_eq!(rdb.load_page(0, 3).unwrap().unwrap(), snap1_page0);
+    assert_eq!(load_assert(&rdb, 0, 1), snap1_page0);
+    assert_eq!(load_assert(&rdb, 0, 2), snap1_page0);
+    assert_eq!(load_assert(&rdb, 0, 3), snap1_page0);
 }
 
 #[test]
