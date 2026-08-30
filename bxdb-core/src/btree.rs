@@ -314,7 +314,10 @@ impl PageStore {
         out: &mut [u8; PAGE_SIZE],
     ) -> io::Result<()> {
         match rec.kind {
-            ChunkKind::Zero => Ok(()),
+            ChunkKind::Zero => {
+                out.fill(0);
+                Ok(())
+            },
             ChunkKind::Full => self.decompress_blob_into(rec, out),
             ChunkKind::Delta => {
                 let base_rec = self.exact_lookup(rec.base_key)?.ok_or_else(|| {
