@@ -33,10 +33,9 @@ pub unsafe extern "C" fn bxdb_open_for_append_only(
         Ok(s) => s,
         Err(_) => return ptr::null_mut(),
     };
-    match AppendOnlyDb::open(name, worker_count as usize, delta_threshold, use_shadow) {
-        Ok(db) => Box::into_raw(Box::new(BxdbHandle::AppendOnly(db))),
-        Err(_) => ptr::null_mut(),
-    }
+    let db = AppendOnlyDb::open(name, worker_count as usize, delta_threshold, use_shadow)
+        .expect("bxdb_open_for_append_only");
+    Box::into_raw(Box::new(BxdbHandle::AppendOnly(db)))
 }
 
 #[unsafe(no_mangle)]
@@ -48,10 +47,8 @@ pub unsafe extern "C" fn bxdb_open_for_btree(name: *const c_char) -> *mut BxdbHa
         Ok(s) => s,
         Err(_) => return ptr::null_mut(),
     };
-    match BtreeDb::open(name) {
-        Ok(db) => Box::into_raw(Box::new(BxdbHandle::Btree(db))),
-        Err(_) => ptr::null_mut(),
-    }
+    let db = BtreeDb::open(name).expect("bxdb_open_for_btree");
+    Box::into_raw(Box::new(BxdbHandle::Btree(db)))
 }
 
 #[unsafe(no_mangle)]
@@ -62,7 +59,7 @@ pub unsafe extern "C" fn bxdb_close(db: *mut BxdbHandle) {
     {
         let handle = unsafe { &mut *db };
         if let BxdbHandle::AppendOnly(w) = handle {
-            let _ = w.flush();
+            w.flush().expect("bxdb_close: flush");
         }
     }
     drop(unsafe { Box::from_raw(db) });
@@ -85,7 +82,9 @@ pub unsafe extern "C" fn bxdb_save_all_pages(
     };
     let mem_len = (total_page_count as usize).saturating_mul(PAGE_SIZE);
     let mem = unsafe { slice::from_raw_parts(memory as *const u8, mem_len) };
-    let _ = append_db.save_all_pages(mem, total_page_count, snapshot_id);
+    append_db
+        .save_all_pages(mem, total_page_count, snapshot_id)
+        .expect("bxdb_save_all_pages");
 }
 
 #[unsafe(no_mangle)]
@@ -108,7 +107,9 @@ pub unsafe extern "C" fn bxdb_save_pages_with_bitmap(
     let mem = unsafe { slice::from_raw_parts(memory as *const u8, mem_len) };
     let bitmap_words = ((total_page_count + 63) / 64) as usize;
     let bitmap = unsafe { slice::from_raw_parts(dirty_bitmap, bitmap_words) };
-    let _ = append_db.save_pages_with_bitmap(mem, bitmap, total_page_count, snapshot_id);
+    append_db
+        .save_pages_with_bitmap(mem, bitmap, total_page_count, snapshot_id)
+        .expect("bxdb_save_pages_with_bitmap");
 }
 
 #[unsafe(no_mangle)]
@@ -126,10 +127,10 @@ pub unsafe extern "C" fn bxdb_load_page(
         BxdbHandle::Btree(r) => r,
         _ => return false,
     };
-    match btree_db.load_page(unsafe { &mut *(page as *mut [u8; 4096]) }, pa, snapshot_id) {
-        Ok(true) => true,
-        _ => false,
-    }
+
+    btree_db
+        .load_page(unsafe { &mut *(page as *mut [u8; 4096]) }, pa, snapshot_id)
+        .expect("bxdb_load_page")
 }
 
 #[unsafe(no_mangle)]
@@ -159,7 +160,7 @@ pub unsafe extern "C" fn bxdb_load_all_pages(
             snapshot_id,
             worker_count.max(1) as usize,
         )
-        .unwrap_or(false)
+        .expect("bxdb_load_all_pages")
 }
 
 #[unsafe(no_mangle)]
@@ -173,11 +174,9 @@ pub unsafe extern "C" fn bxdb_cache_create(name: *const c_char) -> bool {
     };
     let dir = Path::new(name);
     let canonical = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
-    let cache_path = match btree::shm_cache_path(&canonical) {
-        Ok(p) => p,
-        Err(_) => return false,
-    };
-    cache::SharedCache::create(&cache_path, &canonical).is_ok()
+    let cache_path = btree::shm_cache_path(&canonical).expect("bxdb_cache_create: shm_cache_path");
+    cache::SharedCache::create(&cache_path, &canonical).expect("bxdb_cache_create");
+    true
 }
 
 #[unsafe(no_mangle)]
@@ -191,14 +190,11 @@ pub unsafe extern "C" fn bxdb_cache_delete(name: *const c_char) -> bool {
     };
     let dir = Path::new(name);
     let canonical = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
-    let cache_path = match btree::shm_cache_path(&canonical) {
-        Ok(p) => p,
-        Err(_) => return false,
-    };
-    let ok = std::fs::remove_file(&cache_path).is_ok();
+    let cache_path = btree::shm_cache_path(&canonical).expect("bxdb_cache_delete: shm_cache_path");
+    std::fs::remove_file(&cache_path).expect("bxdb_cache_delete: remove_file");
     // Also try to remove the parent hash directory.
     if let Some(parent) = cache_path.parent() {
-        let _ = std::fs::remove_dir(parent);
+        std::fs::remove_dir(parent).expect("bxdb_cache_delete: remove_dir");
     }
-    ok
+    true
 }
